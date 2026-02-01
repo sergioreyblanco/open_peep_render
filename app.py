@@ -120,6 +120,12 @@ class OptionsResponse(BaseModel):
     sort: list[str]
 
 
+class WorkoutInfo(BaseModel):
+    """Information about a single workout."""
+    workout_num: int
+    result_type: str  # 'time', 'reps', or 'weight'
+
+
 class AvailableDataResponse(BaseModel):
     """Available data in the CSV file."""
     years: list[int]
@@ -128,6 +134,7 @@ class AvailableDataResponse(BaseModel):
     scaled: list[str]
     num_workouts: int
     total_athletes: int
+    workout_types: list[WorkoutInfo]
 
 
 class DistributionPoint(BaseModel):
@@ -200,17 +207,60 @@ def get_or_create_scraper(year: int, division: str, region: str, scaled: str, so
     return scraper
 
 
-def calculate_distribution(df: pd.DataFrame, workout_num: int, user_percentile: float) -> list[DistributionPoint]:
-    """Calculate the distribution of athletes across percentile buckets."""
+def detect_workout_type(df: pd.DataFrame, workout_num: int) -> str:
+    """Detect the result type for a workout based on the display values."""
     display_col = f"workout_{workout_num}_display"
     
     if display_col not in df.columns:
+        return "reps"
+    
+    # Get a sample of non-null display values
+    sample_values = df[display_col].dropna().head(100)
+    
+    if sample_values.empty:
+        return "reps"
+    
+    # Check the format of the first few values to determine type
+    time_count = 0
+    reps_count = 0
+    weight_count = 0
+    
+    for val in sample_values:
+        val_str = str(val).strip().lower()
+        if ':' in val_str and not 'lbs' in val_str and not 'kg' in val_str:
+            time_count += 1
+        elif 'lbs' in val_str or 'kg' in val_str or 'lb' in val_str:
+            weight_count += 1
+        elif 'reps' in val_str or val_str.replace(' ', '').isdigit():
+            reps_count += 1
+        else:
+            # Check if it's a number followed by 'reps'
+            import re
+            if re.match(r'^\d+\s*(reps?)?$', val_str):
+                reps_count += 1
+    
+    # Return the most common type
+    if time_count >= reps_count and time_count >= weight_count:
+        return "time"
+    elif weight_count >= reps_count:
+        return "weight"
+    else:
+        return "reps"
+
+
+def calculate_distribution(df: pd.DataFrame, workout_num: int, user_percentile: float) -> list[DistributionPoint]:
+    """Calculate the distribution of athletes across percentile buckets using actual rank data."""
+    rank_col = f"workout_{workout_num}_rank"
+    display_col = f"workout_{workout_num}_display"
+    
+    if rank_col not in df.columns or display_col not in df.columns:
         return []
     
-    # Filter out null values
-    valid_count = df[display_col].notna().sum()
+    # Filter out null values - only count athletes with valid results
+    valid_df = df[df[display_col].notna() & df[rank_col].notna()]
+    total_valid = len(valid_df)
     
-    if valid_count == 0:
+    if total_valid == 0:
         return []
     
     # Create distribution buckets (0-5%, 5-10%, ..., 95-100%)
@@ -221,9 +271,14 @@ def calculate_distribution(df: pd.DataFrame, workout_num: int, user_percentile: 
         bucket_start = i
         bucket_end = i + bucket_size
         
-        # Calculate athlete count for this bucket (approximate based on uniform distribution)
-        # In a real scenario, we'd calculate this based on actual rank distribution
-        athlete_count = int(valid_count * bucket_size / 100)
+        # Calculate the rank range for this percentile bucket
+        # Percentile X means X% of athletes are worse (have higher rank)
+        # So percentile 0-5% means ranks from 95% to 100% of total
+        rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
+        rank_end = int(total_valid * (100 - bucket_start) / 100)
+        
+        # Count athletes in this rank range
+        athlete_count = len(valid_df[(valid_df[rank_col] >= rank_start) & (valid_df[rank_col] <= rank_end)])
         
         # Check if user is in this bucket
         is_user_bucket = bucket_start <= user_percentile < bucket_end
@@ -273,13 +328,20 @@ async def get_available_data():
         else:
             break
     
+    # Detect workout types for each workout
+    workout_types = []
+    for i in range(1, num_workouts + 1):
+        result_type = detect_workout_type(df, i)
+        workout_types.append(WorkoutInfo(workout_num=i, result_type=result_type))
+    
     return AvailableDataResponse(
         years=years,
         divisions=divisions,
         regions=regions,
         scaled=scaled,
         num_workouts=num_workouts,
-        total_athletes=len(df)
+        total_athletes=len(df),
+        workout_types=workout_types
     )
 
 

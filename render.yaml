@@ -13,4 +13,3 @@ services:
         value: "3.11.8"
     healthCheckPath: /
     autoDeploy: true
-
