@@ -324,8 +324,10 @@ def calculate_percentile_from_db(cursor, year: int, division: str, region: str, 
         except ValueError:
             continue
     
-    percentile = (athletes_beaten / total_athletes) * 100
     rank = athletes_better + 1
+    # Percentile = percentage of athletes you performed better than or equal to
+    # If you're ranked R out of N, you beat (N - R) athletes
+    percentile = ((total_athletes - rank) / total_athletes) * 100
     
     return round(percentile, 2), rank, total_athletes
 
@@ -347,6 +349,13 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     if total_valid == 0:
         return []
     
+    # Use ROW_NUMBER to get sequential positions (handles ties correctly)
+    # Then count how many athletes fall into each percentile bucket
+    # Position 1 = best performer, Position N = worst performer
+    # Percentile for position P out of N = ((N - P) / N) * 100
+    # So for bucket X-Y%, we want positions where: X <= ((N-P)/N)*100 < Y
+    # Solving: position > N * (100 - Y) / 100 AND position <= N * (100 - X) / 100
+    
     distribution = []
     bucket_size = 5
     
@@ -354,15 +363,22 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         bucket_start = i
         bucket_end = i + bucket_size
         
-        rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
-        rank_end = int(total_valid * (100 - bucket_start) / 100)
+        # Calculate position range for this percentile bucket
+        # Higher percentile = lower position (better rank)
+        pos_start = int(total_valid * (100 - bucket_end) / 100)  # exclusive lower bound
+        pos_end = int(total_valid * (100 - bucket_start) / 100)  # inclusive upper bound
         
+        # Use ROW_NUMBER to assign sequential positions based on workout rank
         cursor.execute(f"""
-            SELECT COUNT(*) FROM crossfit_open_results 
-            WHERE {conditions} 
-            AND workout_{workout_num}_rank >= %s 
-            AND workout_{workout_num}_rank <= %s
-        """, params + (rank_start, rank_end))
+            SELECT COUNT(*) FROM (
+                SELECT ROW_NUMBER() OVER (ORDER BY workout_{workout_num}_rank ASC) as pos
+                FROM crossfit_open_results 
+                WHERE {conditions} 
+                AND workout_{workout_num}_display IS NOT NULL 
+                AND workout_{workout_num}_rank IS NOT NULL
+            ) AS ranked
+            WHERE pos > %s AND pos <= %s
+        """, params + (pos_start, pos_end))
         
         athlete_count = cursor.fetchone()[0]
         is_user_bucket = bucket_start <= user_percentile < bucket_end
