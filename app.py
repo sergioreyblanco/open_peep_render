@@ -333,17 +333,22 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     """
     conditions, params = get_filter_conditions(year, division, region, scaled)
     
-    # Get total valid athletes (those with both display and rank values)
+    # Get the MAX rank value to use as the total for bucket calculations
+    # This is important because COUNT(*) might be higher than MAX(rank) due to ties
+    # The scraper uses len(valid_df) which corresponds to the actual rank range
     cursor.execute(f"""
-        SELECT COUNT(*) FROM crossfit_open_results 
+        SELECT MAX(workout_{workout_num}_rank) FROM crossfit_open_results 
         WHERE {conditions} 
         AND workout_{workout_num}_display IS NOT NULL 
         AND workout_{workout_num}_rank IS NOT NULL
     """, params)
-    total_valid = cursor.fetchone()[0]
+    max_rank = cursor.fetchone()[0]
     
-    if total_valid == 0:
+    if max_rank is None or max_rank == 0:
         return []
+    
+    # Use max_rank as total_valid for bucket calculations (matches scraper behavior)
+    total_valid = max_rank
     
     # Build distribution using actual rank values (like the original pandas code)
     # This matches the original logic:

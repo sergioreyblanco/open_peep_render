@@ -629,6 +629,61 @@ class PercentileCalculator:
         percentile, _, _ = self.calculate_percentile_and_rank(workout_num, result)
         return percentile
 
+    def calculate_distribution(self, workout_num: int, user_percentile: float) -> list[dict]:
+        """
+        Calculate the distribution of athletes across percentile buckets.
+
+        Args:
+            workout_num: Workout number (1, 2, or 3)
+            user_percentile: The user's percentile for highlighting their bucket
+
+        Returns:
+            List of dicts with percentile_range, athlete_count, is_user_bucket
+        """
+        if self.df is None or self.df.empty:
+            return []
+
+        rank_col = f"workout_{workout_num}_rank"
+        display_col = f"workout_{workout_num}_display"
+
+        if rank_col not in self.df.columns or display_col not in self.df.columns:
+            return []
+
+        # Filter out null values - only count athletes with valid results
+        valid_df = self.df[self.df[display_col].notna() & self.df[rank_col].notna()]
+        total_valid = len(valid_df)
+
+        if total_valid == 0:
+            return []
+
+        # Create distribution buckets (0-5%, 5-10%, ..., 95-100%)
+        distribution = []
+        bucket_size = 5
+
+        for i in range(0, 100, bucket_size):
+            bucket_start = i
+            bucket_end = i + bucket_size
+
+            # Calculate the rank range for this percentile bucket
+            # Percentile X means X% of athletes are worse (have higher rank)
+            # So percentile 0-5% means ranks from 95% to 100% of total
+            rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
+            rank_end = int(total_valid * (100 - bucket_start) / 100)
+
+            # Count athletes in this rank range
+            athlete_count = len(valid_df[(valid_df[rank_col] >= rank_start) & (valid_df[rank_col] <= rank_end)])
+
+            # Check if user is in this bucket
+            is_user_bucket = bucket_start <= user_percentile < bucket_end
+
+            distribution.append({
+                "percentile_range": f"{bucket_start}-{bucket_end}%",
+                "athlete_count": athlete_count,
+                "is_user_bucket": is_user_bucket
+            })
+
+        return distribution
+
     def calculate_overall_percentile_and_rank(
         self, results: dict
     ) -> Tuple[float, int, int, int, list]:
@@ -832,6 +887,31 @@ def interactive_console(calculator: PercentileCalculator, num_workouts: int = 3)
                 print(f"  Percentile: {percentile:.2f}%")
                 print(f"  You beat {percentile:.1f}% of athletes!")
                 print(f"{'=' * 50}")
+                
+                # Calculate and display distribution
+                distribution = calculator.calculate_distribution(workout_num, percentile)
+                if distribution:
+                    print(f"\n  DISTRIBUTION (Workout {workout_num})")
+                    print(f"  {'-' * 46}")
+                    
+                    # Find max count for scaling the bar chart
+                    max_count = max(d["athlete_count"] for d in distribution)
+                    bar_width = 25
+                    
+                    for bucket in distribution:
+                        pct_range = bucket["percentile_range"]
+                        count = bucket["athlete_count"]
+                        is_user = bucket["is_user_bucket"]
+                        
+                        # Scale bar length
+                        bar_len = int((count / max_count) * bar_width) if max_count > 0 else 0
+                        bar = "█" * bar_len + "░" * (bar_width - bar_len)
+                        
+                        # Highlight user's bucket
+                        marker = " ◄── YOU" if is_user else ""
+                        print(f"  {pct_range:>10} |{bar}| {count:>6,}{marker}")
+                    
+                    print(f"  {'-' * 46}")
             except ValueError as e:
                 print(f"Error: {e}")
 
