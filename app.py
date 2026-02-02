@@ -329,33 +329,73 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                                      workout_num: int, user_percentile: float) -> list[DistributionPoint]:
     """
     Calculate the distribution of athletes across percentile buckets.
-    Uses actual stored rank values like the original pandas implementation.
+    Uses actual workout display values (parsed results) to properly handle
+    mixed time/reps results for time-based workouts.
     """
     conditions, params = get_filter_conditions(year, division, region, scaled)
     
-    # Get the MAX rank value to use as the total for bucket calculations
-    # This is important because COUNT(*) might be higher than MAX(rank) due to ties
-    # The scraper uses len(valid_df) which corresponds to the actual rank range
+    # Fetch all display values
     cursor.execute(f"""
-        SELECT MAX(workout_{workout_num}_rank) FROM crossfit_open_results 
-        WHERE {conditions} 
-        AND workout_{workout_num}_display IS NOT NULL 
-        AND workout_{workout_num}_rank IS NOT NULL
+        SELECT workout_{workout_num}_display FROM crossfit_open_results 
+        WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
     """, params)
-    max_rank = cursor.fetchone()[0]
     
-    if max_rank is None or max_rank == 0:
+    # Parse all results and create sortable values
+    # For sorting: we need to handle the case where time workouts have mixed time/reps
+    # Time results are better than reps results for time-based workouts
+    parsed_results = []
+    for (display_val,) in cursor.fetchall():
+        try:
+            result_type, value = PercentileCalculator.parse_result(str(display_val))
+            parsed_results.append((result_type, value))
+        except ValueError:
+            continue  # Skip unparseable values
+    
+    if not parsed_results:
         return []
     
-    # Use max_rank as total_valid for bucket calculations (matches scraper behavior)
-    total_valid = max_rank
+    total_valid = len(parsed_results)
     
-    # Build distribution using actual rank values (like the original pandas code)
-    # This matches the original logic:
-    #   rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
-    #   rank_end = int(total_valid * (100 - bucket_start) / 100)
-    #   athlete_count = len(valid_df[(valid_df[rank_col] >= rank_start) & (valid_df[rank_col] <= rank_end)])
+    # Detect workout type based on majority of results
+    time_count = sum(1 for r in parsed_results if r[0] == "time")
+    reps_count = sum(1 for r in parsed_results if r[0] == "reps")
+    weight_count = sum(1 for r in parsed_results if r[0] == "weight")
     
+    if time_count >= reps_count and time_count >= weight_count:
+        workout_type = "time"
+    elif weight_count >= reps_count:
+        workout_type = "weight"
+    else:
+        workout_type = "reps"
+    
+    # Sort results from best to worst
+    # For time workouts: time results first (sorted ascending), then reps results (sorted descending)
+    # For weight workouts: higher weight is better
+    # For reps workouts: higher reps is better
+    def sort_key(result):
+        result_type, value = result
+        if workout_type == "time":
+            # Time results are better than reps results
+            # Lower time is better, so sort ascending
+            # Reps results come after all time results, higher reps is better among reps
+            if result_type == "time":
+                return (0, value)  # Primary sort: 0 for time, then by time value (lower is better)
+            else:
+                return (1, -value)  # Primary sort: 1 for reps (worse), then by -reps (higher reps is better)
+        elif workout_type == "weight":
+            # Higher weight is better
+            return -value
+        else:  # reps
+            # Higher reps is better
+            if result_type == "time":
+                return (0, value)  # Time means finished, which is best for reps workouts too
+            else:
+                return (1, -value)  # Higher reps is better
+    
+    sorted_results = sorted(parsed_results, key=sort_key)
+    
+    # Assign ranks based on sorted order (1-indexed, 1 is best)
+    # Then count how many fall into each percentile bucket
     distribution = []
     bucket_size = 5
     
@@ -369,17 +409,13 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
         rank_end = int(total_valid * (100 - bucket_start) / 100)
         
-        # Count athletes whose actual stored rank falls in this range
-        cursor.execute(f"""
-            SELECT COUNT(*) FROM crossfit_open_results 
-            WHERE {conditions} 
-            AND workout_{workout_num}_display IS NOT NULL 
-            AND workout_{workout_num}_rank IS NOT NULL
-            AND workout_{workout_num}_rank >= %s 
-            AND workout_{workout_num}_rank <= %s
-        """, params + (rank_start, rank_end))
+        # Count athletes in this rank range
+        # Ranks are 1-indexed, so rank 1 is index 0
+        athlete_count = 0
+        for rank in range(rank_start, rank_end + 1):
+            if 1 <= rank <= total_valid:
+                athlete_count += 1
         
-        athlete_count = cursor.fetchone()[0]
         is_user_bucket = bucket_start <= user_percentile < bucket_end
         
         distribution.append(DistributionPoint(
