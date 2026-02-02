@@ -326,12 +326,15 @@ def calculate_percentile_from_db(cursor, year: int, division: str, region: str, 
 
 
 def calculate_distribution_from_db(cursor, year: int, division: str, region: str, scaled: str,
-                                     workout_num: int, user_percentile: float) -> list[DistributionPoint]:
+                                     workout_num: int, user_percentile: float, user_result: str = None) -> list[DistributionPoint]:
     """
-    Calculate the distribution of athletes across percentile buckets.
-    Uses actual workout display values (parsed results) to properly handle
-    mixed time/reps results for time-based workouts.
+    Calculate the distribution of athletes across result-based buckets.
+    Creates 10 buckets based on actual workout results (reps, time, or weight).
+    For time workouts with mixed time/reps results, time finishers are shown
+    first (best), then non-finishers (reps) are shown after.
     """
+    import math
+    
     conditions, params = get_filter_conditions(year, division, region, scaled)
     
     # Fetch all display values
@@ -340,9 +343,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
     """, params)
     
-    # Parse all results and create sortable values
-    # For sorting: we need to handle the case where time workouts have mixed time/reps
-    # Time results are better than reps results for time-based workouts
+    # Parse all results
     parsed_results = []
     for (display_val,) in cursor.fetchall():
         try:
@@ -353,8 +354,6 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     
     if not parsed_results:
         return []
-    
-    total_valid = len(parsed_results)
     
     # Detect workout type based on majority of results
     time_count = sum(1 for r in parsed_results if r[0] == "time")
@@ -368,68 +367,231 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     else:
         workout_type = "reps"
     
-    # Sort results from best to worst
-    # For time workouts: time results first (sorted ascending), then reps results (sorted descending)
-    # For weight workouts: higher weight is better
-    # For reps workouts: higher reps is better
-    def sort_key(result):
-        result_type, value = result
-        if workout_type == "time":
-            # Time results are better than reps results
-            # Lower time is better, so sort ascending
-            # Reps results come after all time results, higher reps is better among reps
-            if result_type == "time":
-                return (0, value)  # Primary sort: 0 for time, then by time value (lower is better)
-            else:
-                return (1, -value)  # Primary sort: 1 for reps (worse), then by -reps (higher reps is better)
-        elif workout_type == "weight":
-            # Higher weight is better
-            return -value
-        else:  # reps
-            # Higher reps is better
-            if result_type == "time":
-                return (0, value)  # Time means finished, which is best for reps workouts too
-            else:
-                return (1, -value)  # Higher reps is better
+    # Parse user's result if provided
+    user_type, user_value = None, None
+    if user_result:
+        try:
+            user_type, user_value = PercentileCalculator.parse_result(user_result)
+        except ValueError:
+            pass
     
-    sorted_results = sorted(parsed_results, key=sort_key)
-    
-    # Assign ranks based on sorted order (1-indexed, 1 is best)
-    # Handle ties: athletes with the same result get the same rank
-    ranks = []
-    current_rank = 1
-    for idx, result in enumerate(sorted_results):
-        if idx > 0 and sort_key(result) == sort_key(sorted_results[idx - 1]):
-            # Same as previous, use same rank
-            ranks.append(ranks[-1])
-        else:
-            ranks.append(current_rank)
-        current_rank = idx + 2  # Next position (1-indexed)
-    
-    # Count athletes in each percentile bucket based on their computed rank
+    num_buckets = 10
     distribution = []
-    bucket_size = 5
     
-    for i in range(0, 100, bucket_size):
-        bucket_start = i
-        bucket_end = i + bucket_size
+    def format_time(seconds: float) -> str:
+        """Format seconds as MM:SS or H:MM:SS."""
+        if seconds >= 3600:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        else:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}:{secs:02d}"
+    
+    def get_nice_bucket_size(val_range: float, target_buckets: int = 10) -> float:
+        """Calculate a nice round bucket size."""
+        raw_size = val_range / target_buckets
+        if raw_size <= 0:
+            return 1
+        magnitude = 10 ** int(math.floor(math.log10(raw_size)))
+        normalized = raw_size / magnitude
+        if normalized <= 1:
+            nice = 1
+        elif normalized <= 2:
+            nice = 2
+        elif normalized <= 2.5:
+            nice = 2.5
+        elif normalized <= 5:
+            nice = 5
+        else:
+            nice = 10
+        return nice * magnitude
+    
+    def get_nice_time_bucket_size(val_range: float, target_buckets: int = 10) -> float:
+        """Calculate a nice time bucket size in seconds."""
+        raw_size = val_range / target_buckets
+        if raw_size <= 15:
+            return 15
+        elif raw_size <= 30:
+            return 30
+        elif raw_size <= 60:
+            return 60
+        elif raw_size <= 90:
+            return 90
+        elif raw_size <= 120:
+            return 120
+        elif raw_size <= 180:
+            return 180
+        else:
+            return 300
+    
+    if workout_type == "time":
+        time_results = sorted([v for t, v in parsed_results if t == "time"])
+        reps_results = sorted([v for t, v in parsed_results if t == "reps"], reverse=True)
         
-        # Calculate rank range for this percentile bucket
-        # Percentile X means X% of athletes are worse (have higher rank)
-        # So percentile 0-5% means ranks from 95% to 100% of total
-        rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
-        rank_end = int(total_valid * (100 - bucket_start) / 100)
+        if time_results:
+            min_time = min(time_results)
+            max_time = max(time_results)
+            time_range = max_time - min_time if max_time > min_time else 60
+            
+            if reps_results:
+                finisher_ratio = len(time_results) / len(parsed_results)
+                time_bucket_count = max(3, min(8, int(num_buckets * finisher_ratio + 0.5)))
+                reps_bucket_count = num_buckets - time_bucket_count
+            else:
+                time_bucket_count = num_buckets
+                reps_bucket_count = 0
+            
+            bucket_size = get_nice_time_bucket_size(time_range, time_bucket_count)
+            bucket_start_time = int(min_time // bucket_size) * bucket_size
+            
+            for i in range(time_bucket_count):
+                b_start = bucket_start_time + i * bucket_size
+                b_end = bucket_start_time + (i + 1) * bucket_size
+                
+                if i == time_bucket_count - 1:
+                    count = sum(1 for v in time_results if v >= b_start)
+                else:
+                    count = sum(1 for v in time_results if b_start <= v < b_end)
+                
+                is_user = False
+                if user_type == "time" and user_value is not None:
+                    if i == time_bucket_count - 1:
+                        is_user = user_value >= b_start
+                    else:
+                        is_user = b_start <= user_value < b_end
+                
+                distribution.append(DistributionPoint(
+                    percentile_range=f"{format_time(b_start)}-{format_time(b_end)}",
+                    athlete_count=count,
+                    is_user_bucket=is_user
+                ))
+            
+            if reps_results and reps_bucket_count > 0:
+                min_reps = min(reps_results)
+                max_reps = max(reps_results)
+                reps_range = max_reps - min_reps if max_reps > min_reps else 10
+                bucket_size = get_nice_bucket_size(reps_range, reps_bucket_count)
+                bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
+                
+                for i in range(reps_bucket_count):
+                    b_end = bucket_max - i * bucket_size
+                    b_start = bucket_max - (i + 1) * bucket_size
+                    
+                    if i == reps_bucket_count - 1:
+                        count = sum(1 for v in reps_results if v <= b_end)
+                    else:
+                        count = sum(1 for v in reps_results if b_start < v <= b_end)
+                    
+                    is_user = False
+                    if user_type == "reps" and user_value is not None:
+                        if i == reps_bucket_count - 1:
+                            is_user = user_value <= b_end
+                        else:
+                            is_user = b_start < user_value <= b_end
+                    
+                    distribution.append(DistributionPoint(
+                        percentile_range=f"{int(b_start)+1}-{int(b_end)} reps (DNF)",
+                        athlete_count=count,
+                        is_user_bucket=is_user
+                    ))
         
-        # Count athletes whose rank falls in this range
-        athlete_count = sum(1 for r in ranks if rank_start <= r <= rank_end)
+        elif reps_results:
+            min_reps = min(reps_results)
+            max_reps = max(reps_results)
+            reps_range = max_reps - min_reps if max_reps > min_reps else 10
+            bucket_size = get_nice_bucket_size(reps_range, num_buckets)
+            bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
+            
+            for i in range(num_buckets):
+                b_end = bucket_max - i * bucket_size
+                b_start = bucket_max - (i + 1) * bucket_size
+                
+                if i == num_buckets - 1:
+                    count = sum(1 for v in reps_results if v <= b_end)
+                else:
+                    count = sum(1 for v in reps_results if b_start < v <= b_end)
+                
+                is_user = False
+                if user_type == "reps" and user_value is not None:
+                    if i == num_buckets - 1:
+                        is_user = user_value <= b_end
+                    else:
+                        is_user = b_start < user_value <= b_end
+                
+                distribution.append(DistributionPoint(
+                    percentile_range=f"{int(b_start)+1}-{int(b_end)} reps",
+                    athlete_count=count,
+                    is_user_bucket=is_user
+                ))
+    
+    elif workout_type == "reps":
+        values = [v for t, v in parsed_results if t == "reps"]
+        if not values:
+            return []
         
-        is_user_bucket = bucket_start <= user_percentile < bucket_end
+        min_val = min(values)
+        max_val = max(values)
+        val_range = max_val - min_val if max_val > min_val else 10
+        bucket_size = get_nice_bucket_size(val_range, num_buckets)
+        bucket_max = int(math.ceil(max_val / bucket_size)) * bucket_size
         
-        distribution.append(DistributionPoint(
-            percentile_range=f"{bucket_start}-{bucket_end}%",
-            athlete_count=athlete_count,
-            is_user_bucket=is_user_bucket
-        ))
+        for i in range(num_buckets):
+            b_end = bucket_max - i * bucket_size
+            b_start = bucket_max - (i + 1) * bucket_size
+            
+            if i == num_buckets - 1:
+                count = sum(1 for v in values if v <= b_end)
+            else:
+                count = sum(1 for v in values if b_start < v <= b_end)
+            
+            is_user = False
+            if user_type == "reps" and user_value is not None:
+                if i == num_buckets - 1:
+                    is_user = user_value <= b_end
+                else:
+                    is_user = b_start < user_value <= b_end
+            
+            distribution.append(DistributionPoint(
+                percentile_range=f"{int(b_start)+1}-{int(b_end)} reps",
+                athlete_count=count,
+                is_user_bucket=is_user
+            ))
+    
+    else:  # weight
+        values = [v for t, v in parsed_results if t == "weight"]
+        if not values:
+            return []
+        
+        min_val = min(values)
+        max_val = max(values)
+        val_range = max_val - min_val if max_val > min_val else 10
+        bucket_size = get_nice_bucket_size(val_range, num_buckets)
+        bucket_max = int(math.ceil(max_val / bucket_size)) * bucket_size
+        
+        for i in range(num_buckets):
+            b_end = bucket_max - i * bucket_size
+            b_start = bucket_max - (i + 1) * bucket_size
+            
+            if i == num_buckets - 1:
+                count = sum(1 for v in values if v <= b_end)
+            else:
+                count = sum(1 for v in values if b_start < v <= b_end)
+            
+            is_user = False
+            if user_type == "weight" and user_value is not None:
+                if i == num_buckets - 1:
+                    is_user = user_value <= b_end
+                else:
+                    is_user = b_start < user_value <= b_end
+            
+            distribution.append(DistributionPoint(
+                percentile_range=f"{int(b_start)+1}-{int(b_end)} lbs",
+                athlete_count=count,
+                is_user_bucket=is_user
+            ))
     
     return distribution
 
@@ -685,7 +847,7 @@ async def get_workout_result(
             
             # Calculate distribution
             distribution = calculate_distribution_from_db(
-                cursor, year, division, region, scaled, workout_num, percentile
+                cursor, year, division, region, scaled, workout_num, percentile, result
             )
             
             cursor.close()

@@ -629,58 +629,302 @@ class PercentileCalculator:
         percentile, _, _ = self.calculate_percentile_and_rank(workout_num, result)
         return percentile
 
-    def calculate_distribution(self, workout_num: int, user_percentile: float) -> list[dict]:
+    def calculate_distribution(self, workout_num: int, user_percentile: float, user_result: str = None) -> list[dict]:
         """
-        Calculate the distribution of athletes across percentile buckets.
+        Calculate the distribution of athletes across result-based buckets.
+        
+        Creates 10 buckets based on actual workout results (reps, time, or weight).
+        For time workouts with mixed time/reps results, time finishers are shown
+        first (best), then non-finishers (reps) are shown after.
 
         Args:
             workout_num: Workout number (1, 2, or 3)
-            user_percentile: The user's percentile for highlighting their bucket
+            user_percentile: The user's percentile (kept for compatibility)
+            user_result: The user's result string to determine their bucket
 
         Returns:
-            List of dicts with percentile_range, athlete_count, is_user_bucket
+            List of dicts with percentile_range (result range), athlete_count, is_user_bucket
         """
         if self.df is None or self.df.empty:
             return []
 
-        rank_col = f"workout_{workout_num}_rank"
         display_col = f"workout_{workout_num}_display"
 
-        if rank_col not in self.df.columns or display_col not in self.df.columns:
+        if display_col not in self.df.columns:
             return []
 
-        # Filter out null values - only count athletes with valid results
-        valid_df = self.df[self.df[display_col].notna() & self.df[rank_col].notna()]
-        total_valid = len(valid_df)
+        # Parse all results
+        parsed_results = []
+        for val in self.df[display_col].dropna():
+            try:
+                result_type, value = self.parse_result(str(val))
+                parsed_results.append((result_type, value))
+            except ValueError:
+                continue
 
-        if total_valid == 0:
+        if not parsed_results:
             return []
 
-        # Create distribution buckets (0-5%, 5-10%, ..., 95-100%)
+        # Detect workout type based on majority
+        time_count = sum(1 for r in parsed_results if r[0] == "time")
+        reps_count = sum(1 for r in parsed_results if r[0] == "reps")
+        weight_count = sum(1 for r in parsed_results if r[0] == "weight")
+
+        if time_count >= reps_count and time_count >= weight_count:
+            workout_type = "time"
+        elif weight_count >= reps_count:
+            workout_type = "weight"
+        else:
+            workout_type = "reps"
+
+        # Parse user's result if provided
+        user_type, user_value = None, None
+        if user_result:
+            try:
+                user_type, user_value = self.parse_result(user_result)
+            except ValueError:
+                pass
+
+        num_buckets = 10
         distribution = []
-        bucket_size = 5
 
-        for i in range(0, 100, bucket_size):
-            bucket_start = i
-            bucket_end = i + bucket_size
+        def format_time(seconds: float) -> str:
+            """Format seconds as MM:SS or H:MM:SS."""
+            if seconds >= 3600:
+                hours = int(seconds // 3600)
+                minutes = int((seconds % 3600) // 60)
+                secs = int(seconds % 60)
+                return f"{hours}:{minutes:02d}:{secs:02d}"
+            else:
+                minutes = int(seconds // 60)
+                secs = int(seconds % 60)
+                return f"{minutes}:{secs:02d}"
 
-            # Calculate the rank range for this percentile bucket
-            # Percentile X means X% of athletes are worse (have higher rank)
-            # So percentile 0-5% means ranks from 95% to 100% of total
-            rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
-            rank_end = int(total_valid * (100 - bucket_start) / 100)
+        def get_nice_bucket_size(val_range: float, target_buckets: int = 10) -> float:
+            """Calculate a nice round bucket size."""
+            raw_size = val_range / target_buckets
+            if raw_size <= 0:
+                return 1
+            # Round to a nice number (1, 2, 5, 10, 20, 25, 50, 100, etc.)
+            magnitude = 10 ** int(math.floor(math.log10(raw_size)))
+            normalized = raw_size / magnitude
+            if normalized <= 1:
+                nice = 1
+            elif normalized <= 2:
+                nice = 2
+            elif normalized <= 2.5:
+                nice = 2.5
+            elif normalized <= 5:
+                nice = 5
+            else:
+                nice = 10
+            return nice * magnitude
 
-            # Count athletes in this rank range
-            athlete_count = len(valid_df[(valid_df[rank_col] >= rank_start) & (valid_df[rank_col] <= rank_end)])
+        def get_nice_time_bucket_size(val_range: float, target_buckets: int = 10) -> float:
+            """Calculate a nice time bucket size in seconds (30s, 60s, 90s, 120s, etc.)."""
+            raw_size = val_range / target_buckets
+            if raw_size <= 15:
+                return 15  # 15 seconds
+            elif raw_size <= 30:
+                return 30  # 30 seconds
+            elif raw_size <= 60:
+                return 60  # 1 minute
+            elif raw_size <= 90:
+                return 90  # 1.5 minutes
+            elif raw_size <= 120:
+                return 120  # 2 minutes
+            elif raw_size <= 180:
+                return 180  # 3 minutes
+            else:
+                return 300  # 5 minutes
 
-            # Check if user is in this bucket
-            is_user_bucket = bucket_start <= user_percentile < bucket_end
+        import math
 
-            distribution.append({
-                "percentile_range": f"{bucket_start}-{bucket_end}%",
-                "athlete_count": athlete_count,
-                "is_user_bucket": is_user_bucket
-            })
+        if workout_type == "time":
+            # Separate time finishers from reps (non-finishers)
+            time_results = sorted([v for t, v in parsed_results if t == "time"])
+            reps_results = sorted([v for t, v in parsed_results if t == "reps"], reverse=True)
+            
+            if time_results:
+                min_time = min(time_results)
+                max_time = max(time_results)
+                time_range = max_time - min_time if max_time > min_time else 60
+                
+                # Determine bucket allocation between finishers and non-finishers
+                if reps_results:
+                    finisher_ratio = len(time_results) / len(parsed_results)
+                    time_bucket_count = max(3, min(8, int(num_buckets * finisher_ratio + 0.5)))
+                    reps_bucket_count = num_buckets - time_bucket_count
+                else:
+                    time_bucket_count = num_buckets
+                    reps_bucket_count = 0
+                
+                # Create time buckets (lower time = better, so best times first)
+                bucket_size = get_nice_time_bucket_size(time_range, time_bucket_count)
+                # Round min_time down to nice boundary
+                bucket_start = int(min_time // bucket_size) * bucket_size
+                
+                for i in range(time_bucket_count):
+                    b_start = bucket_start + i * bucket_size
+                    b_end = bucket_start + (i + 1) * bucket_size
+                    
+                    # Count athletes in this bucket
+                    count = sum(1 for v in time_results if b_start <= v < b_end)
+                    # Last time bucket catches anything >= b_start if we've gone past max
+                    if i == time_bucket_count - 1:
+                        count = sum(1 for v in time_results if v >= b_start)
+                    
+                    # Check if user is in this bucket
+                    is_user = False
+                    if user_type == "time" and user_value is not None:
+                        if i == time_bucket_count - 1:
+                            is_user = user_value >= b_start
+                        else:
+                            is_user = b_start <= user_value < b_end
+                    
+                    distribution.append({
+                        "percentile_range": f"{format_time(b_start)}-{format_time(b_end)}",
+                        "athlete_count": count,
+                        "is_user_bucket": is_user
+                    })
+                
+                # Create reps buckets for non-finishers (higher reps = better among DNF)
+                if reps_results and reps_bucket_count > 0:
+                    min_reps = min(reps_results)
+                    max_reps = max(reps_results)
+                    reps_range = max_reps - min_reps if max_reps > min_reps else 10
+                    bucket_size = get_nice_bucket_size(reps_range, reps_bucket_count)
+                    
+                    # Round max_reps up to nice boundary
+                    bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
+                    
+                    for i in range(reps_bucket_count):
+                        # Go from best reps (highest) to worst (lowest)
+                        b_end = bucket_max - i * bucket_size
+                        b_start = bucket_max - (i + 1) * bucket_size
+                        
+                        if i == reps_bucket_count - 1:
+                            count = sum(1 for v in reps_results if v <= b_end)
+                        else:
+                            count = sum(1 for v in reps_results if b_start < v <= b_end)
+                        
+                        is_user = False
+                        if user_type == "reps" and user_value is not None:
+                            if i == reps_bucket_count - 1:
+                                is_user = user_value <= b_end
+                            else:
+                                is_user = b_start < user_value <= b_end
+                        
+                        distribution.append({
+                            "percentile_range": f"{int(b_start)+1}-{int(b_end)} reps (DNF)",
+                            "athlete_count": count,
+                            "is_user_bucket": is_user
+                        })
+            
+            elif reps_results:
+                # Only reps results (no finishers) - higher reps is better
+                min_reps = min(reps_results)
+                max_reps = max(reps_results)
+                reps_range = max_reps - min_reps if max_reps > min_reps else 10
+                bucket_size = get_nice_bucket_size(reps_range, num_buckets)
+                
+                bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
+                
+                for i in range(num_buckets):
+                    b_end = bucket_max - i * bucket_size
+                    b_start = bucket_max - (i + 1) * bucket_size
+                    
+                    if i == num_buckets - 1:
+                        count = sum(1 for v in reps_results if v <= b_end)
+                    else:
+                        count = sum(1 for v in reps_results if b_start < v <= b_end)
+                    
+                    is_user = False
+                    if user_type == "reps" and user_value is not None:
+                        if i == num_buckets - 1:
+                            is_user = user_value <= b_end
+                        else:
+                            is_user = b_start < user_value <= b_end
+                    
+                    distribution.append({
+                        "percentile_range": f"{int(b_start)+1}-{int(b_end)} reps",
+                        "athlete_count": count,
+                        "is_user_bucket": is_user
+                    })
+
+        elif workout_type == "reps":
+            # For reps: higher is better
+            values = [v for t, v in parsed_results if t == "reps"]
+            if not values:
+                return []
+            
+            min_val = min(values)
+            max_val = max(values)
+            val_range = max_val - min_val if max_val > min_val else 10
+            bucket_size = get_nice_bucket_size(val_range, num_buckets)
+            
+            # Round max up to nice boundary
+            bucket_max = int(math.ceil(max_val / bucket_size)) * bucket_size
+            
+            for i in range(num_buckets):
+                # From highest (best) to lowest (worst)
+                b_end = bucket_max - i * bucket_size
+                b_start = bucket_max - (i + 1) * bucket_size
+                
+                if i == num_buckets - 1:
+                    count = sum(1 for v in values if v <= b_end)
+                else:
+                    count = sum(1 for v in values if b_start < v <= b_end)
+                
+                is_user = False
+                if user_type == "reps" and user_value is not None:
+                    if i == num_buckets - 1:
+                        is_user = user_value <= b_end
+                    else:
+                        is_user = b_start < user_value <= b_end
+                
+                distribution.append({
+                    "percentile_range": f"{int(b_start)+1}-{int(b_end)} reps",
+                    "athlete_count": count,
+                    "is_user_bucket": is_user
+                })
+
+        else:  # weight
+            # For weight: higher is better
+            values = [v for t, v in parsed_results if t == "weight"]
+            if not values:
+                return []
+            
+            min_val = min(values)
+            max_val = max(values)
+            val_range = max_val - min_val if max_val > min_val else 10
+            bucket_size = get_nice_bucket_size(val_range, num_buckets)
+            
+            # Round max up to nice boundary
+            bucket_max = int(math.ceil(max_val / bucket_size)) * bucket_size
+            
+            for i in range(num_buckets):
+                # From highest (best) to lowest (worst)
+                b_end = bucket_max - i * bucket_size
+                b_start = bucket_max - (i + 1) * bucket_size
+                
+                if i == num_buckets - 1:
+                    count = sum(1 for v in values if v <= b_end)
+                else:
+                    count = sum(1 for v in values if b_start < v <= b_end)
+                
+                is_user = False
+                if user_type == "weight" and user_value is not None:
+                    if i == num_buckets - 1:
+                        is_user = user_value <= b_end
+                    else:
+                        is_user = b_start < user_value <= b_end
+                
+                distribution.append({
+                    "percentile_range": f"{int(b_start)+1}-{int(b_end)} lbs",
+                    "athlete_count": count,
+                    "is_user_bucket": is_user
+                })
 
         return distribution
 
@@ -889,7 +1133,7 @@ def interactive_console(calculator: PercentileCalculator, num_workouts: int = 3)
                 print(f"{'=' * 50}")
                 
                 # Calculate and display distribution
-                distribution = calculator.calculate_distribution(workout_num, percentile)
+                distribution = calculator.calculate_distribution(workout_num, percentile, result)
                 if distribution:
                     print(f"\n  DISTRIBUTION (Workout {workout_num})")
                     print(f"  {'-' * 46}")
