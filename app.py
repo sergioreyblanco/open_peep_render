@@ -276,17 +276,7 @@ def calculate_percentile_from_db(cursor, year: int, division: str, region: str, 
     # Parse the user's result
     user_type, user_value = PercentileCalculator.parse_result(result)
     
-    # Get total athletes with valid results for this workout
-    cursor.execute(f"""
-        SELECT COUNT(*) FROM crossfit_open_results 
-        WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
-    """, params)
-    total_athletes = cursor.fetchone()[0]
-    
-    if total_athletes == 0:
-        raise ValueError(f"No valid scores available for workout {workout_num}")
-    
-    # Get all results and calculate percentile
+    # Get all display results (we'll parse them to count valid ones)
     cursor.execute(f"""
         SELECT workout_{workout_num}_display FROM crossfit_open_results 
         WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
@@ -294,10 +284,12 @@ def calculate_percentile_from_db(cursor, year: int, division: str, region: str, 
     
     athletes_beaten = 0
     athletes_better = 0
+    total_parsed = 0  # Count only successfully parsed results
     
     for (display_val,) in cursor.fetchall():
         try:
             other_type, other_value = PercentileCalculator.parse_result(str(display_val))
+            total_parsed += 1  # Count this as a valid result
             
             if user_type == "time":
                 if other_type == "reps":
@@ -322,22 +314,26 @@ def calculate_percentile_from_db(cursor, year: int, division: str, region: str, 
                     elif other_value > user_value:
                         athletes_better += 1
         except ValueError:
-            continue
+            continue  # Skip unparseable values
     
-    rank = athletes_better + 1
-    # Percentile = percentage of athletes you performed better than or equal to
-    # If you're ranked R out of N, you beat (N - R) athletes
-    percentile = ((total_athletes - rank) / total_athletes) * 100
+    if total_parsed == 0:
+        raise ValueError(f"No valid scores available for workout {workout_num}")
     
-    return round(percentile, 2), rank, total_athletes
+    percentile = (athletes_beaten / total_parsed) * 100
+    rank = athletes_better + 1  # Rank = number of athletes with strictly better results + 1
+    
+    return round(percentile, 2), rank, total_parsed
 
 
 def calculate_distribution_from_db(cursor, year: int, division: str, region: str, scaled: str,
                                      workout_num: int, user_percentile: float) -> list[DistributionPoint]:
-    """Calculate the distribution of athletes across percentile buckets."""
+    """
+    Calculate the distribution of athletes across percentile buckets.
+    Uses actual stored rank values like the original pandas implementation.
+    """
     conditions, params = get_filter_conditions(year, division, region, scaled)
     
-    # Get total valid athletes
+    # Get total valid athletes (those with both display and rank values)
     cursor.execute(f"""
         SELECT COUNT(*) FROM crossfit_open_results 
         WHERE {conditions} 
@@ -349,12 +345,11 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     if total_valid == 0:
         return []
     
-    # Use ROW_NUMBER to get sequential positions (handles ties correctly)
-    # Then count how many athletes fall into each percentile bucket
-    # Position 1 = best performer, Position N = worst performer
-    # Percentile for position P out of N = ((N - P) / N) * 100
-    # So for bucket X-Y%, we want positions where: X <= ((N-P)/N)*100 < Y
-    # Solving: position > N * (100 - Y) / 100 AND position <= N * (100 - X) / 100
+    # Build distribution using actual rank values (like the original pandas code)
+    # This matches the original logic:
+    #   rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
+    #   rank_end = int(total_valid * (100 - bucket_start) / 100)
+    #   athlete_count = len(valid_df[(valid_df[rank_col] >= rank_start) & (valid_df[rank_col] <= rank_end)])
     
     distribution = []
     bucket_size = 5
@@ -363,22 +358,21 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         bucket_start = i
         bucket_end = i + bucket_size
         
-        # Calculate position range for this percentile bucket
-        # Higher percentile = lower position (better rank)
-        pos_start = int(total_valid * (100 - bucket_end) / 100)  # exclusive lower bound
-        pos_end = int(total_valid * (100 - bucket_start) / 100)  # inclusive upper bound
+        # Calculate rank range for this percentile bucket
+        # Percentile X means X% of athletes are worse (have higher rank)
+        # So percentile 0-5% means ranks from 95% to 100% of total
+        rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
+        rank_end = int(total_valid * (100 - bucket_start) / 100)
         
-        # Use ROW_NUMBER to assign sequential positions based on workout rank
+        # Count athletes whose actual stored rank falls in this range
         cursor.execute(f"""
-            SELECT COUNT(*) FROM (
-                SELECT ROW_NUMBER() OVER (ORDER BY workout_{workout_num}_rank ASC) as pos
-                FROM crossfit_open_results 
-                WHERE {conditions} 
-                AND workout_{workout_num}_display IS NOT NULL 
-                AND workout_{workout_num}_rank IS NOT NULL
-            ) AS ranked
-            WHERE pos > %s AND pos <= %s
-        """, params + (pos_start, pos_end))
+            SELECT COUNT(*) FROM crossfit_open_results 
+            WHERE {conditions} 
+            AND workout_{workout_num}_display IS NOT NULL 
+            AND workout_{workout_num}_rank IS NOT NULL
+            AND workout_{workout_num}_rank >= %s 
+            AND workout_{workout_num}_rank <= %s
+        """, params + (rank_start, rank_end))
         
         athlete_count = cursor.fetchone()[0]
         is_user_bucket = bucket_start <= user_percentile < bucket_end
