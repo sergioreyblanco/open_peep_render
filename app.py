@@ -355,12 +355,17 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     if not parsed_results:
         return []
     
-    # Detect workout type based on majority of results
+    # Detect workout type
+    # Key insight: if there are BOTH time and reps results, it's a time-capped workout
+    # where finishers have times and non-finishers have reps (DNF)
     time_count = sum(1 for r in parsed_results if r[0] == "time")
     reps_count = sum(1 for r in parsed_results if r[0] == "reps")
     weight_count = sum(1 for r in parsed_results if r[0] == "weight")
     
-    if time_count >= reps_count and time_count >= weight_count:
+    # If there are any time results mixed with reps, it's a time-capped workout
+    if time_count > 0 and reps_count > 0:
+        workout_type = "time"
+    elif time_count > 0:
         workout_type = "time"
     elif weight_count >= reps_count:
         workout_type = "weight"
@@ -444,24 +449,23 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                 time_bucket_count = num_buckets
                 reps_bucket_count = 0
             
+            # Create time buckets - cover FULL range from min to max
             bucket_size = get_nice_time_bucket_size(time_range, time_bucket_count)
-            bucket_start_time = int(min_time // bucket_size) * bucket_size
+            bucket_min = int(min_time // bucket_size) * bucket_size
+            bucket_max_time = int(math.ceil(max_time / bucket_size)) * bucket_size
             
-            for i in range(time_bucket_count):
-                b_start = bucket_start_time + i * bucket_size
-                b_end = bucket_start_time + (i + 1) * bucket_size
+            # Calculate actual number of buckets needed
+            actual_time_bucket_count = int((bucket_max_time - bucket_min) / bucket_size)
+            
+            for i in range(actual_time_bucket_count):
+                b_start = bucket_min + i * bucket_size
+                b_end = bucket_min + (i + 1) * bucket_size
                 
-                if i == time_bucket_count - 1:
-                    count = sum(1 for v in time_results if v >= b_start)
-                else:
-                    count = sum(1 for v in time_results if b_start <= v < b_end)
+                count = sum(1 for v in time_results if b_start <= v < b_end)
                 
                 is_user = False
                 if user_type == "time" and user_value is not None:
-                    if i == time_bucket_count - 1:
-                        is_user = user_value >= b_start
-                    else:
-                        is_user = b_start <= user_value < b_end
+                    is_user = b_start <= user_value < b_end
                 
                 distribution.append(DistributionPoint(
                     percentile_range=f"{format_time(b_start)}-{format_time(b_end)}",
@@ -469,28 +473,30 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                     is_user_bucket=is_user
                 ))
             
-            if reps_results and reps_bucket_count > 0:
+            # Create reps buckets for non-finishers - cover FULL range
+            if reps_results:
                 min_reps = min(reps_results)
                 max_reps = max(reps_results)
                 reps_range = max_reps - min_reps if max_reps > min_reps else 10
-                bucket_size = get_nice_bucket_size(reps_range, reps_bucket_count)
-                bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
+                bucket_size = get_nice_bucket_size(reps_range, max(reps_bucket_count, 1))
                 
-                for i in range(reps_bucket_count):
-                    b_end = bucket_max - i * bucket_size
-                    b_start = bucket_max - (i + 1) * bucket_size
+                # Round min down and max up to nice boundaries
+                bucket_min_reps = int(min_reps // bucket_size) * bucket_size
+                bucket_max_reps = int(math.ceil(max_reps / bucket_size)) * bucket_size
+                
+                # Calculate actual number of buckets needed
+                actual_reps_bucket_count = int((bucket_max_reps - bucket_min_reps) / bucket_size)
+                
+                for i in range(actual_reps_bucket_count):
+                    # Go from best reps (highest) to worst (lowest)
+                    b_end = bucket_max_reps - i * bucket_size
+                    b_start = bucket_max_reps - (i + 1) * bucket_size
                     
-                    if i == reps_bucket_count - 1:
-                        count = sum(1 for v in reps_results if v <= b_end)
-                    else:
-                        count = sum(1 for v in reps_results if b_start < v <= b_end)
+                    count = sum(1 for v in reps_results if b_start < v <= b_end)
                     
                     is_user = False
                     if user_type == "reps" and user_value is not None:
-                        if i == reps_bucket_count - 1:
-                            is_user = user_value <= b_end
-                        else:
-                            is_user = b_start < user_value <= b_end
+                        is_user = b_start < user_value <= b_end
                     
                     distribution.append(DistributionPoint(
                         percentile_range=f"{int(b_start)+1}-{int(b_end)} reps (DNF)",

@@ -476,7 +476,7 @@ class PercentileCalculator:
         Parse a workout result string into a normalized value.
 
         Args:
-            result: Result string (e.g., "300 reps", "4:01", "300", "130 lbs")
+            result: Result string (e.g., "300 reps", "4:01", "300", "130 lbs", "128 reps - s")
 
         Returns:
             Tuple of (result_type, normalized_value)
@@ -508,8 +508,9 @@ class PercentileCalculator:
             weight = float(weight_match.group(1))
             return ("weight", weight)
 
-        # Check for reps format
-        reps_pattern = r"^(\d+)\s*(?:reps?)?$"
+        # Check for reps format (e.g., "300", "300 reps", "128 reps - s", "123 reps - f")
+        # The " - s" and " - f" suffixes indicate scaled/foundations but we ignore them
+        reps_pattern = r"^(\d+)\s*(?:reps?)?\s*(?:-\s*[sf])?$"
         reps_match = re.match(reps_pattern, result)
         if reps_match:
             reps = int(reps_match.group(1))
@@ -665,12 +666,17 @@ class PercentileCalculator:
         if not parsed_results:
             return []
 
-        # Detect workout type based on majority
+        # Detect workout type
+        # Key insight: if there are BOTH time and reps results, it's a time-capped workout
+        # where finishers have times and non-finishers have reps (DNF)
         time_count = sum(1 for r in parsed_results if r[0] == "time")
         reps_count = sum(1 for r in parsed_results if r[0] == "reps")
         weight_count = sum(1 for r in parsed_results if r[0] == "weight")
 
-        if time_count >= reps_count and time_count >= weight_count:
+        # If there are any time results mixed with reps, it's a time-capped workout
+        if time_count > 0 and reps_count > 0:
+            workout_type = "time"
+        elif time_count > 0:
             workout_type = "time"
         elif weight_count >= reps_count:
             workout_type = "weight"
@@ -750,7 +756,7 @@ class PercentileCalculator:
                 max_time = max(time_results)
                 time_range = max_time - min_time if max_time > min_time else 60
                 
-                # Determine bucket allocation between finishers and non-finishers
+                # Calculate bucket size for time (use time_bucket_count as hint)
                 if reps_results:
                     finisher_ratio = len(time_results) / len(parsed_results)
                     time_bucket_count = max(3, min(8, int(num_buckets * finisher_ratio + 0.5)))
@@ -759,28 +765,26 @@ class PercentileCalculator:
                     time_bucket_count = num_buckets
                     reps_bucket_count = 0
                 
-                # Create time buckets (lower time = better, so best times first)
+                # Create time buckets - cover FULL range from min to max
                 bucket_size = get_nice_time_bucket_size(time_range, time_bucket_count)
-                # Round min_time down to nice boundary
-                bucket_start = int(min_time // bucket_size) * bucket_size
+                # Round min_time down and max_time up to nice boundaries
+                bucket_min = int(min_time // bucket_size) * bucket_size
+                bucket_max = int(math.ceil(max_time / bucket_size)) * bucket_size
                 
-                for i in range(time_bucket_count):
-                    b_start = bucket_start + i * bucket_size
-                    b_end = bucket_start + (i + 1) * bucket_size
+                # Calculate actual number of buckets needed
+                actual_time_bucket_count = int((bucket_max - bucket_min) / bucket_size)
+                
+                for i in range(actual_time_bucket_count):
+                    b_start = bucket_min + i * bucket_size
+                    b_end = bucket_min + (i + 1) * bucket_size
                     
                     # Count athletes in this bucket
                     count = sum(1 for v in time_results if b_start <= v < b_end)
-                    # Last time bucket catches anything >= b_start if we've gone past max
-                    if i == time_bucket_count - 1:
-                        count = sum(1 for v in time_results if v >= b_start)
                     
                     # Check if user is in this bucket
                     is_user = False
                     if user_type == "time" and user_value is not None:
-                        if i == time_bucket_count - 1:
-                            is_user = user_value >= b_start
-                        else:
-                            is_user = b_start <= user_value < b_end
+                        is_user = b_start <= user_value < b_end
                     
                     distribution.append({
                         "percentile_range": f"{format_time(b_start)}-{format_time(b_end)}",
@@ -789,31 +793,34 @@ class PercentileCalculator:
                     })
                 
                 # Create reps buckets for non-finishers (higher reps = better among DNF)
-                if reps_results and reps_bucket_count > 0:
+                # Create enough buckets to cover the FULL range from min to max
+                if reps_results:
                     min_reps = min(reps_results)
                     max_reps = max(reps_results)
                     reps_range = max_reps - min_reps if max_reps > min_reps else 10
-                    bucket_size = get_nice_bucket_size(reps_range, reps_bucket_count)
                     
-                    # Round max_reps up to nice boundary
+                    # Calculate bucket size to get approximately reps_bucket_count buckets
+                    # but ensure we cover the full range
+                    bucket_size = get_nice_bucket_size(reps_range, max(reps_bucket_count, 1))
+                    
+                    # Round min down and max up to nice boundaries
+                    bucket_min = int(min_reps // bucket_size) * bucket_size
                     bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
                     
-                    for i in range(reps_bucket_count):
+                    # Calculate actual number of buckets needed to cover the range
+                    actual_bucket_count = int((bucket_max - bucket_min) / bucket_size)
+                    
+                    for i in range(actual_bucket_count):
                         # Go from best reps (highest) to worst (lowest)
                         b_end = bucket_max - i * bucket_size
                         b_start = bucket_max - (i + 1) * bucket_size
                         
-                        if i == reps_bucket_count - 1:
-                            count = sum(1 for v in reps_results if v <= b_end)
-                        else:
-                            count = sum(1 for v in reps_results if b_start < v <= b_end)
+                        # Count athletes in this bucket
+                        count = sum(1 for v in reps_results if b_start < v <= b_end)
                         
                         is_user = False
                         if user_type == "reps" and user_value is not None:
-                            if i == reps_bucket_count - 1:
-                                is_user = user_value <= b_end
-                            else:
-                                is_user = b_start < user_value <= b_end
+                            is_user = b_start < user_value <= b_end
                         
                         distribution.append({
                             "percentile_range": f"{int(b_start)+1}-{int(b_end)} reps (DNF)",
