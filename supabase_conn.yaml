@@ -1,0 +1,6 @@
+HOST: 'aws-1-eu-central-1.pooler.supabase.com'
+PORT: '5432'
+DBNAME: 'postgres'
+USER: 'postgres.jscnrwqxsonarqxupqdj'
+PASSWORD: 'caserio5456.'
+pool_mode: 'session'

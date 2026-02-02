@@ -15,10 +15,14 @@ import argparse
 import re
 import sys
 import time as time_module
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 import requests
+import yaml
 
 
 class CrossFitLeaderboardScraper:
@@ -266,6 +270,113 @@ class CrossFitLeaderboardScraper:
             print(f"Data saved to {filename}")
         else:
             print("No data to save. Run scrape() first.")
+
+    def save_to_supabase(self, config_path: str, verbose: bool = True, batch_size: int = 1000) -> None:
+        """
+        Save the dataframe to a Supabase PostgreSQL table using batch inserts.
+
+        Args:
+            config_path: Path to the YAML file containing Supabase connection details
+            verbose: Print progress information
+            batch_size: Number of rows to insert per batch (default: 1000)
+        """
+        if self.df is None or self.df.empty:
+            print("No data to save. Run scrape() first.")
+            return
+
+        # Load connection config from YAML
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        # Connect to Supabase PostgreSQL
+        conn = psycopg2.connect(
+            host=config['HOST'],
+            port=config['PORT'],
+            dbname=config['DBNAME'],
+            user=config['USER'],
+            password=config['PASSWORD']
+        )
+        cursor = conn.cursor()
+
+        if verbose:
+            print(f"Connected to Supabase database")
+            print(f"Inserting {len(self.df):,} rows into crossfit_open_results (batch size: {batch_size})...")
+
+        # Prepare the insert statement with all workout columns (1-7)
+        insert_sql = """
+            INSERT INTO crossfit_open_results (
+                year, division, region, scaled, sort, rank, name, country,
+                workout_1_display, workout_1_rank, workout_1_score,
+                workout_2_display, workout_2_rank, workout_2_score,
+                workout_3_display, workout_3_rank, workout_3_score,
+                workout_4_display, workout_4_rank, workout_4_score,
+                workout_5_display, workout_5_rank, workout_5_score,
+                workout_6_display, workout_6_rank, workout_6_score,
+                workout_7_display, workout_7_rank, workout_7_score,
+                inserted_at
+            ) VALUES %s
+        """
+
+        inserted_at = datetime.now(timezone.utc)
+
+        # Helper to safely get column value or None
+        def get_val(row, col):
+            if col in row.index and pd.notna(row[col]):
+                return row[col]
+            return None
+
+        # Prepare all rows as tuples
+        all_values = []
+        for _, row in self.df.iterrows():
+            values = (
+                get_val(row, 'year'),
+                get_val(row, 'division'),
+                get_val(row, 'region'),
+                get_val(row, 'scaled'),
+                get_val(row, 'sort'),
+                get_val(row, 'rank'),
+                get_val(row, 'name'),
+                get_val(row, 'country'),
+                get_val(row, 'workout_1_display'),
+                get_val(row, 'workout_1_rank'),
+                get_val(row, 'workout_1_score'),
+                get_val(row, 'workout_2_display'),
+                get_val(row, 'workout_2_rank'),
+                get_val(row, 'workout_2_score'),
+                get_val(row, 'workout_3_display'),
+                get_val(row, 'workout_3_rank'),
+                get_val(row, 'workout_3_score'),
+                get_val(row, 'workout_4_display'),
+                get_val(row, 'workout_4_rank'),
+                get_val(row, 'workout_4_score'),
+                get_val(row, 'workout_5_display'),
+                get_val(row, 'workout_5_rank'),
+                get_val(row, 'workout_5_score'),
+                get_val(row, 'workout_6_display'),
+                get_val(row, 'workout_6_rank'),
+                get_val(row, 'workout_6_score'),
+                get_val(row, 'workout_7_display'),
+                get_val(row, 'workout_7_rank'),
+                get_val(row, 'workout_7_score'),
+                inserted_at,
+            )
+            all_values.append(values)
+
+        # Insert in batches using execute_values (much faster than individual inserts)
+        total_inserted = 0
+        for i in range(0, len(all_values), batch_size):
+            batch = all_values[i:i + batch_size]
+            execute_values(cursor, insert_sql, batch, page_size=batch_size)
+            total_inserted += len(batch)
+            if verbose:
+                print(f"Inserted {total_inserted:,} / {len(all_values):,} rows...")
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        if verbose:
+            print(f"Successfully inserted {total_inserted:,} rows into crossfit_open_results")
 
     @classmethod
     def load_from_csv(
@@ -806,7 +917,20 @@ Available sort options: {', '.join(sort_choices)}
         "--output",
         type=str,
         default=None,
-        help="Output CSV file path (optional)",
+        help="Output CSV file path (optional, used when --output-type is 'csv')",
+    )
+    parser.add_argument(
+        "--output-type",
+        type=str,
+        choices=["csv", "supabase"],
+        default="csv",
+        help="Output destination type: 'csv' (default) or 'supabase'",
+    )
+    parser.add_argument(
+        "--supabase-config",
+        type=str,
+        default="supabase_conn.yaml",
+        help="Path to Supabase connection YAML config file (default: supabase_conn.yaml)",
     )
     parser.add_argument(
         "--no-interactive",
@@ -850,9 +974,12 @@ Available sort options: {', '.join(sort_choices)}
         available_cols = [c for c in display_cols if c in df.columns]
         print(df[available_cols].head(10).to_string(index=False))
 
-        # Save to CSV if requested
-        if args.output and not args.input:  # Don't save if we just loaded from CSV
-            scraper.save_to_csv(args.output)
+        # Save output if requested (and not just loading from CSV)
+        if not args.input:
+            if args.output_type == "csv" and args.output:
+                scraper.save_to_csv(args.output)
+            elif args.output_type == "supabase":
+                scraper.save_to_supabase(args.supabase_config)
 
         # Run interactive calculator
         if not args.no_interactive:

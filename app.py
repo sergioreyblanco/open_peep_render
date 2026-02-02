@@ -2,25 +2,63 @@
 CrossFit Games Open Leaderboard API
 
 FastAPI backend for the CrossFit leaderboard scraper.
+Uses Supabase PostgreSQL for data storage.
 """
 
 import os
+from contextlib import contextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import pandas as pd
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+import yaml
 
 from crossfit_leaderboard_scraper import (
     CrossFitLeaderboardScraper,
     PercentileCalculator,
 )
 
-# Path to the CSV data file
-CSV_DATA_PATH = os.path.join(os.path.dirname(__file__), "results_2025_men_worlwide_Rx.csv")
+# Path to Supabase connection config
+SUPABASE_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "supabase_conn.yaml")
 
-# Pre-load the CSV data at startup
-_csv_data: Optional[pd.DataFrame] = None
+# Connection pool (initialized on startup)
+_pool: Optional[ThreadedConnectionPool] = None
+
+
+def get_db_config() -> dict:
+    """Load database configuration from YAML file."""
+    with open(SUPABASE_CONFIG_PATH, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def init_connection_pool():
+    """Initialize the database connection pool."""
+    global _pool
+    if _pool is None:
+        config = get_db_config()
+        _pool = ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            host=config['HOST'],
+            port=config['PORT'],
+            dbname=config['DBNAME'],
+            user=config['USER'],
+            password=config['PASSWORD']
+        )
+
+
+@contextmanager
+def get_db_connection():
+    """Get a database connection from the pool."""
+    if _pool is None:
+        init_connection_pool()
+    conn = _pool.getconn()
+    try:
+        yield conn
+    finally:
+        _pool.putconn(conn)
 
 app = FastAPI(
     title="CrossFit Open Leaderboard API",
@@ -37,13 +75,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cache for scraped data to avoid repeated API calls
-_cache: dict = {}
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database connection pool on startup."""
+    init_connection_pool()
 
 
-def get_cache_key(year: int, division: str, region: str, scaled: str, sort: str) -> str:
-    """Generate a cache key for the given parameters."""
-    return f"{year}:{division}:{region}:{scaled}:{sort}"
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connection pool on shutdown."""
+    global _pool
+    if _pool is not None:
+        _pool.closeall()
 
 
 # --- Pydantic Models ---
@@ -153,93 +197,65 @@ class WorkoutResultResponse(BaseModel):
     distribution: list[DistributionPoint]
 
 
-# --- Helper Functions ---
+# --- Database Helper Functions ---
 
 
-def load_csv_data() -> pd.DataFrame:
-    """Load and return the CSV data, caching it globally."""
-    global _csv_data
-    if _csv_data is None:
-        if not os.path.exists(CSV_DATA_PATH):
-            raise HTTPException(status_code=500, detail=f"CSV data file not found: {CSV_DATA_PATH}")
-        _csv_data = pd.read_csv(CSV_DATA_PATH)
-    return _csv_data
+def get_filter_conditions(year: int, division: str, region: str, scaled: str) -> tuple[str, tuple]:
+    """Build SQL WHERE conditions for filtering."""
+    conditions = "year = %s AND division = %s AND region = %s AND scaled = %s"
+    params = (year, division, region, scaled)
+    return conditions, params
 
 
-def get_or_create_scraper(year: int, division: str, region: str, scaled: str, sort: str = "Overall") -> CrossFitLeaderboardScraper:
-    """Get a scraper instance from cache or create one from CSV data."""
-    cache_key = get_cache_key(year, division, region, scaled, sort)
+def get_num_workouts_from_db(cursor, year: int, division: str, region: str, scaled: str) -> int:
+    """Get the number of workouts with data for the given filters."""
+    conditions, params = get_filter_conditions(year, division, region, scaled)
     
-    if cache_key in _cache:
-        return _cache[cache_key]
-    
-    # Load from CSV
-    df = load_csv_data()
-    
-    # Filter data
-    filtered_df = df[
-        (df["year"] == year) &
-        (df["division"] == division) &
-        (df["region"] == region) &
-        (df["scaled"] == scaled)
-    ]
-    
-    if filtered_df.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No data found for year={year}, division={division}, region={region}, scaled={scaled}"
-        )
-    
-    # Create scraper instance
-    scraper = CrossFitLeaderboardScraper(
-        year=year,
-        division=division,
-        region=region,
-        scaled=scaled,
-        sort=sort,
-    )
-    scraper.df = filtered_df.copy()
-    scraper.num_workouts = scraper._detect_num_workouts()
-    
-    # Cache it
-    _cache[cache_key] = scraper
-    
-    return scraper
+    # Check which workout columns have non-null values
+    num_workouts = 0
+    for i in range(1, 8):
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM crossfit_open_results 
+            WHERE {conditions} AND workout_{i}_display IS NOT NULL
+            LIMIT 1
+        """, params)
+        count = cursor.fetchone()[0]
+        if count > 0:
+            num_workouts = i
+        else:
+            break
+    return num_workouts
 
 
-def detect_workout_type(df: pd.DataFrame, workout_num: int) -> str:
-    """Detect the result type for a workout based on the display values."""
-    display_col = f"workout_{workout_num}_display"
+def detect_workout_type_from_db(cursor, year: int, division: str, region: str, scaled: str, workout_num: int) -> str:
+    """Detect the result type for a workout based on sample display values."""
+    conditions, params = get_filter_conditions(year, division, region, scaled)
     
-    if display_col not in df.columns:
+    cursor.execute(f"""
+        SELECT workout_{workout_num}_display 
+        FROM crossfit_open_results 
+        WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
+        LIMIT 100
+    """, params)
+    
+    rows = cursor.fetchall()
+    if not rows:
         return "reps"
     
-    # Get a sample of non-null display values
-    sample_values = df[display_col].dropna().head(100)
-    
-    if sample_values.empty:
-        return "reps"
-    
-    # Check the format of the first few values to determine type
     time_count = 0
     reps_count = 0
     weight_count = 0
     
-    for val in sample_values:
+    import re
+    for (val,) in rows:
         val_str = str(val).strip().lower()
-        if ':' in val_str and not 'lbs' in val_str and not 'kg' in val_str:
+        if ':' in val_str and 'lbs' not in val_str and 'kg' not in val_str:
             time_count += 1
         elif 'lbs' in val_str or 'kg' in val_str or 'lb' in val_str:
             weight_count += 1
-        elif 'reps' in val_str or val_str.replace(' ', '').isdigit():
+        elif re.match(r'^\d+\s*(reps?)?$', val_str):
             reps_count += 1
-        else:
-            # Check if it's a number followed by 'reps'
-            import re
-            if re.match(r'^\d+\s*(reps?)?$', val_str):
-                reps_count += 1
     
-    # Return the most common type
     if time_count >= reps_count and time_count >= weight_count:
         return "time"
     elif weight_count >= reps_count:
@@ -248,22 +264,89 @@ def detect_workout_type(df: pd.DataFrame, workout_num: int) -> str:
         return "reps"
 
 
-def calculate_distribution(df: pd.DataFrame, workout_num: int, user_percentile: float) -> list[DistributionPoint]:
-    """Calculate the distribution of athletes across percentile buckets using actual rank data."""
-    rank_col = f"workout_{workout_num}_rank"
-    display_col = f"workout_{workout_num}_display"
+def calculate_percentile_from_db(cursor, year: int, division: str, region: str, scaled: str, 
+                                   workout_num: int, result: str) -> tuple[float, int, int]:
+    """
+    Calculate percentile and rank for a workout result using database queries.
     
-    if rank_col not in df.columns or display_col not in df.columns:
-        return []
+    Returns: (percentile, rank, total_athletes)
+    """
+    conditions, params = get_filter_conditions(year, division, region, scaled)
     
-    # Filter out null values - only count athletes with valid results
-    valid_df = df[df[display_col].notna() & df[rank_col].notna()]
-    total_valid = len(valid_df)
+    # Parse the user's result
+    user_type, user_value = PercentileCalculator.parse_result(result)
+    
+    # Get total athletes with valid results for this workout
+    cursor.execute(f"""
+        SELECT COUNT(*) FROM crossfit_open_results 
+        WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
+    """, params)
+    total_athletes = cursor.fetchone()[0]
+    
+    if total_athletes == 0:
+        raise ValueError(f"No valid scores available for workout {workout_num}")
+    
+    # Get all results and calculate percentile
+    cursor.execute(f"""
+        SELECT workout_{workout_num}_display FROM crossfit_open_results 
+        WHERE {conditions} AND workout_{workout_num}_display IS NOT NULL
+    """, params)
+    
+    athletes_beaten = 0
+    athletes_better = 0
+    
+    for (display_val,) in cursor.fetchall():
+        try:
+            other_type, other_value = PercentileCalculator.parse_result(str(display_val))
+            
+            if user_type == "time":
+                if other_type == "reps":
+                    athletes_beaten += 1
+                elif other_type == "time":
+                    if other_value > user_value:
+                        athletes_beaten += 1
+                    elif other_value < user_value:
+                        athletes_better += 1
+            elif user_type == "weight":
+                if other_type == "weight":
+                    if other_value < user_value:
+                        athletes_beaten += 1
+                    elif other_value > user_value:
+                        athletes_better += 1
+            else:  # reps
+                if other_type == "time":
+                    athletes_better += 1
+                elif other_type == "reps":
+                    if other_value < user_value:
+                        athletes_beaten += 1
+                    elif other_value > user_value:
+                        athletes_better += 1
+        except ValueError:
+            continue
+    
+    percentile = (athletes_beaten / total_athletes) * 100
+    rank = athletes_better + 1
+    
+    return round(percentile, 2), rank, total_athletes
+
+
+def calculate_distribution_from_db(cursor, year: int, division: str, region: str, scaled: str,
+                                     workout_num: int, user_percentile: float) -> list[DistributionPoint]:
+    """Calculate the distribution of athletes across percentile buckets."""
+    conditions, params = get_filter_conditions(year, division, region, scaled)
+    
+    # Get total valid athletes
+    cursor.execute(f"""
+        SELECT COUNT(*) FROM crossfit_open_results 
+        WHERE {conditions} 
+        AND workout_{workout_num}_display IS NOT NULL 
+        AND workout_{workout_num}_rank IS NOT NULL
+    """, params)
+    total_valid = cursor.fetchone()[0]
     
     if total_valid == 0:
         return []
     
-    # Create distribution buckets (0-5%, 5-10%, ..., 95-100%)
     distribution = []
     bucket_size = 5
     
@@ -271,16 +354,17 @@ def calculate_distribution(df: pd.DataFrame, workout_num: int, user_percentile: 
         bucket_start = i
         bucket_end = i + bucket_size
         
-        # Calculate the rank range for this percentile bucket
-        # Percentile X means X% of athletes are worse (have higher rank)
-        # So percentile 0-5% means ranks from 95% to 100% of total
         rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
         rank_end = int(total_valid * (100 - bucket_start) / 100)
         
-        # Count athletes in this rank range
-        athlete_count = len(valid_df[(valid_df[rank_col] >= rank_start) & (valid_df[rank_col] <= rank_end)])
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM crossfit_open_results 
+            WHERE {conditions} 
+            AND workout_{workout_num}_rank >= %s 
+            AND workout_{workout_num}_rank <= %s
+        """, params + (rank_start, rank_end))
         
-        # Check if user is in this bucket
+        athlete_count = cursor.fetchone()[0]
         is_user_bucket = bucket_start <= user_percentile < bucket_end
         
         distribution.append(DistributionPoint(
@@ -290,6 +374,102 @@ def calculate_distribution(df: pd.DataFrame, workout_num: int, user_percentile: 
         ))
     
     return distribution
+
+
+def calculate_overall_percentile_from_db(cursor, year: int, division: str, region: str, scaled: str,
+                                          results: dict[int, str]) -> tuple[float, int, int, int, list]:
+    """
+    Calculate overall percentile based on combined workout rankings.
+    
+    Returns: (percentile, rank, total_athletes, score, individual_ranks)
+    """
+    conditions, params = get_filter_conditions(year, division, region, scaled)
+    
+    # Find individual ranks for user's results
+    user_ranks = []
+    for workout_num, result in results.items():
+        user_type, user_value = PercentileCalculator.parse_result(result)
+        
+        # Find matching results to get the rank
+        cursor.execute(f"""
+            SELECT workout_{workout_num}_rank FROM crossfit_open_results 
+            WHERE {conditions} 
+            AND workout_{workout_num}_display IS NOT NULL 
+            AND workout_{workout_num}_rank IS NOT NULL
+        """, params)
+        
+        matching_ranks = []
+        for (rank_val,) in cursor.fetchall():
+            # We need to check against display to find matching results
+            cursor.execute(f"""
+                SELECT workout_{workout_num}_display, workout_{workout_num}_rank 
+                FROM crossfit_open_results 
+                WHERE {conditions} 
+                AND workout_{workout_num}_display IS NOT NULL
+            """, params)
+            break  # Only need to query once
+        
+        # Re-query to find matches
+        cursor.execute(f"""
+            SELECT workout_{workout_num}_display, workout_{workout_num}_rank 
+            FROM crossfit_open_results 
+            WHERE {conditions} 
+            AND workout_{workout_num}_display IS NOT NULL 
+            AND workout_{workout_num}_rank IS NOT NULL
+        """, params)
+        
+        for display_val, rank_val in cursor.fetchall():
+            try:
+                other_type, other_value = PercentileCalculator.parse_result(str(display_val))
+                if other_type == user_type and other_value == user_value:
+                    matching_ranks.append(int(rank_val))
+            except ValueError:
+                continue
+        
+        if matching_ranks:
+            avg_rank = round(sum(matching_ranks) / len(matching_ranks))
+            user_ranks.append((workout_num, avg_rank))
+        else:
+            _, calc_rank, _ = calculate_percentile_from_db(
+                cursor, year, division, region, scaled, workout_num, result
+            )
+            user_ranks.append((workout_num, calc_rank))
+    
+    user_score = sum(rank for _, rank in user_ranks)
+    
+    # Build dynamic SQL for sum of ranks
+    workout_nums = list(results.keys())
+    rank_cols = [f"workout_{w}_rank" for w in workout_nums]
+    rank_sum_sql = " + ".join(rank_cols)
+    null_checks = " AND ".join([f"{col} IS NOT NULL" for col in rank_cols])
+    
+    # Get total athletes with all workouts completed
+    cursor.execute(f"""
+        SELECT COUNT(*) FROM crossfit_open_results 
+        WHERE {conditions} AND {null_checks}
+    """, params)
+    total_athletes = cursor.fetchone()[0]
+    
+    if total_athletes == 0:
+        raise ValueError("No valid overall scores available")
+    
+    # Count athletes with better (lower) and worse (higher) scores
+    cursor.execute(f"""
+        SELECT COUNT(*) FROM crossfit_open_results 
+        WHERE {conditions} AND {null_checks} AND ({rank_sum_sql}) > %s
+    """, params + (user_score,))
+    athletes_beaten = cursor.fetchone()[0]
+    
+    cursor.execute(f"""
+        SELECT COUNT(*) FROM crossfit_open_results 
+        WHERE {conditions} AND {null_checks} AND ({rank_sum_sql}) < %s
+    """, params + (user_score,))
+    athletes_with_better_score = cursor.fetchone()[0]
+    
+    percentile = (athletes_beaten / total_athletes) * 100
+    rank = athletes_with_better_score + 1
+    
+    return round(percentile, 2), int(rank), total_athletes, user_score, user_ranks
 
 
 # --- API Endpoints ---
@@ -304,45 +484,63 @@ async def root():
 @app.get("/available-data", response_model=AvailableDataResponse, tags=["Data"])
 async def get_available_data():
     """
-    Get the available data options from the CSV file.
+    Get the available data options from the database.
     
     Returns the unique years, divisions, regions, and scaled types available,
     plus the total number of athletes and workouts.
     """
     try:
-        df = load_csv_data()
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get unique values
+            cursor.execute("SELECT DISTINCT year FROM crossfit_open_results ORDER BY year DESC")
+            years = [row[0] for row in cursor.fetchall()]
+            
+            cursor.execute("SELECT DISTINCT division FROM crossfit_open_results ORDER BY division")
+            divisions = [row[0] for row in cursor.fetchall()]
+            
+            cursor.execute("SELECT DISTINCT region FROM crossfit_open_results ORDER BY region")
+            regions = [row[0] for row in cursor.fetchall()]
+            
+            cursor.execute("SELECT DISTINCT scaled FROM crossfit_open_results ORDER BY scaled")
+            scaled = [row[0] for row in cursor.fetchall()]
+            
+            # Get total athletes
+            cursor.execute("SELECT COUNT(*) FROM crossfit_open_results")
+            total_athletes = cursor.fetchone()[0]
+            
+            # Get number of workouts (check which columns have data)
+            # Use the first available combination to detect workouts
+            if years and divisions and regions and scaled:
+                num_workouts = get_num_workouts_from_db(
+                    cursor, years[0], divisions[0], regions[0], scaled[0]
+                )
+                
+                # Detect workout types
+                workout_types = []
+                for i in range(1, num_workouts + 1):
+                    result_type = detect_workout_type_from_db(
+                        cursor, years[0], divisions[0], regions[0], scaled[0], i
+                    )
+                    workout_types.append(WorkoutInfo(workout_num=i, result_type=result_type))
+            else:
+                num_workouts = 0
+                workout_types = []
+            
+            cursor.close()
+            
+            return AvailableDataResponse(
+                years=years,
+                divisions=divisions,
+                regions=regions,
+                scaled=scaled,
+                num_workouts=num_workouts,
+                total_athletes=total_athletes,
+                workout_types=workout_types
+            )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-    # Get unique values
-    years = sorted(df["year"].unique().tolist(), reverse=True)
-    divisions = sorted(df["division"].unique().tolist())
-    regions = sorted(df["region"].unique().tolist())
-    scaled = sorted(df["scaled"].unique().tolist())
-    
-    # Count workouts by checking columns
-    num_workouts = 0
-    for i in range(1, 20):
-        if f"workout_{i}_display" in df.columns:
-            num_workouts = i
-        else:
-            break
-    
-    # Detect workout types for each workout
-    workout_types = []
-    for i in range(1, num_workouts + 1):
-        result_type = detect_workout_type(df, i)
-        workout_types.append(WorkoutInfo(workout_num=i, result_type=result_type))
-    
-    return AvailableDataResponse(
-        years=years,
-        divisions=divisions,
-        regions=regions,
-        scaled=scaled,
-        num_workouts=num_workouts,
-        total_athletes=len(df),
-        workout_types=workout_types
-    )
 
 
 @app.get("/load-data", tags=["Data"])
@@ -353,21 +551,35 @@ async def load_data(
     scaled: str = Query(default="Rx'd", description="Workout type"),
 ):
     """
-    Load and cache data for the specified parameters.
+    Check data availability for the specified parameters.
     
-    This endpoint loads data from the CSV file and caches it for subsequent
-    percentile calculations.
+    This endpoint checks if data exists in the database for the given filters.
     """
     try:
-        scraper = get_or_create_scraper(year, division, region, scaled)
-        df = scraper.get_dataframe()
-        
-        return {
-            "success": True,
-            "message": "Data loaded successfully",
-            "total_athletes": len(df) if df is not None else 0,
-            "num_workouts": scraper.get_num_workouts()
-        }
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            conditions, params = get_filter_conditions(year, division, region, scaled)
+            
+            cursor.execute(f"""
+                SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}
+            """, params)
+            total_athletes = cursor.fetchone()[0]
+            
+            if total_athletes == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No data found for year={year}, division={division}, region={region}, scaled={scaled}"
+                )
+            
+            num_workouts = get_num_workouts_from_db(cursor, year, division, region, scaled)
+            cursor.close()
+            
+            return {
+                "success": True,
+                "message": "Data available",
+                "total_athletes": total_athletes,
+                "num_workouts": num_workouts
+            }
     except HTTPException:
         raise
     except Exception as e:
@@ -390,31 +602,43 @@ async def get_workout_result(
     to display the results dashboard.
     """
     try:
-        scraper = get_or_create_scraper(year, division, region, scaled)
-        df = scraper.get_dataframe()
-        
-        if df is None or df.empty:
-            raise HTTPException(status_code=404, detail="No data available")
-        
-        if workout_num > scraper.get_num_workouts():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Workout {workout_num} not available. Max workouts: {scraper.get_num_workouts()}"
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Check if data exists
+            conditions, params = get_filter_conditions(year, division, region, scaled)
+            cursor.execute(f"SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}", params)
+            if cursor.fetchone()[0] == 0:
+                raise HTTPException(status_code=404, detail="No data available")
+            
+            # Get number of workouts
+            num_workouts = get_num_workouts_from_db(cursor, year, division, region, scaled)
+            
+            if workout_num > num_workouts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Workout {workout_num} not available. Max workouts: {num_workouts}"
+                )
+            
+            # Calculate percentile
+            percentile, rank, total = calculate_percentile_from_db(
+                cursor, year, division, region, scaled, workout_num, result
             )
-        
-        calculator = PercentileCalculator(df)
-        percentile, rank, total = calculator.calculate_percentile_and_rank(workout_num, result)
-        
-        # Calculate distribution
-        distribution = calculate_distribution(df, workout_num, percentile)
-        
-        return WorkoutResultResponse(
-            percentile=percentile,
-            rank=rank,
-            total_athletes=total,
-            num_workouts=scraper.get_num_workouts(),
-            distribution=distribution
-        )
+            
+            # Calculate distribution
+            distribution = calculate_distribution_from_db(
+                cursor, year, division, region, scaled, workout_num, percentile
+            )
+            
+            cursor.close()
+            
+            return WorkoutResultResponse(
+                percentile=percentile,
+                rank=rank,
+                total_athletes=total,
+                num_workouts=num_workouts,
+                distribution=distribution
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -441,66 +665,77 @@ async def get_leaderboard(
     region: str = Query(default="Worldwide", description="Region name"),
     scaled: str = Query(default="Rx'd", description="Workout type"),
     sort: str = Query(default="Overall", description="Sort order"),
-    max_pages: Optional[int] = Query(default=None, description="Max pages to scrape"),
+    max_pages: Optional[int] = Query(default=None, description="Max pages to scrape (ignored, kept for compatibility)"),
     limit: int = Query(default=100, ge=1, le=1000, description="Number of athletes to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
-    use_cache: bool = Query(default=True, description="Use cached data if available"),
+    use_cache: bool = Query(default=True, description="Ignored, kept for compatibility"),
 ):
     """
-    Fetch leaderboard data from CrossFit Games API.
+    Fetch leaderboard data from database.
     
-    This endpoint scrapes the official CrossFit Games leaderboard and returns
-    athlete rankings and workout results.
+    Returns athlete rankings and workout results with pagination.
     """
-    cache_key = get_cache_key(year, division, region, scaled, sort)
-    
-    # Check cache
-    if use_cache and cache_key in _cache:
-        scraper = _cache[cache_key]
-    else:
-        # Validate parameters
-        if division not in CrossFitLeaderboardScraper.DIVISIONS_REVERSE:
-            raise HTTPException(status_code=400, detail=f"Invalid division: {division}")
-        if region not in CrossFitLeaderboardScraper.REGIONS_REVERSE:
-            raise HTTPException(status_code=400, detail=f"Invalid region: {region}")
-        if scaled not in CrossFitLeaderboardScraper.SCALED_REVERSE:
-            raise HTTPException(status_code=400, detail=f"Invalid scaled type: {scaled}")
-        if sort not in CrossFitLeaderboardScraper.SORT_REVERSE:
-            raise HTTPException(status_code=400, detail=f"Invalid sort order: {sort}")
-        
-        try:
-            scraper = CrossFitLeaderboardScraper(
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            conditions, params = get_filter_conditions(year, division, region, scaled)
+            
+            # Get total count
+            cursor.execute(f"SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}", params)
+            total_athletes = cursor.fetchone()[0]
+            
+            if total_athletes == 0:
+                raise HTTPException(status_code=404, detail="No data found")
+            
+            # Get number of workouts
+            num_workouts = get_num_workouts_from_db(cursor, year, division, region, scaled)
+            
+            # Build column list for workout data
+            workout_cols = []
+            for i in range(1, num_workouts + 1):
+                workout_cols.extend([
+                    f"workout_{i}_display",
+                    f"workout_{i}_rank",
+                    f"workout_{i}_score"
+                ])
+            workout_cols_str = ", ".join(workout_cols) if workout_cols else ""
+            
+            # Fetch paginated data
+            base_cols = "id, year, division, region, scaled, sort, rank, name, country"
+            all_cols = f"{base_cols}, {workout_cols_str}" if workout_cols_str else base_cols
+            
+            cursor.execute(f"""
+                SELECT {all_cols} FROM crossfit_open_results 
+                WHERE {conditions} 
+                ORDER BY rank 
+                LIMIT %s OFFSET %s
+            """, params + (limit, offset))
+            
+            # Get column names
+            col_names = [desc[0] for desc in cursor.description]
+            
+            # Convert to list of dicts
+            athletes = []
+            for row in cursor.fetchall():
+                athlete = dict(zip(col_names, row))
+                athletes.append(athlete)
+            
+            cursor.close()
+            
+            return LeaderboardResponse(
                 year=year,
                 division=division,
                 region=region,
                 scaled=scaled,
                 sort=sort,
+                total_athletes=total_athletes,
+                num_workouts=num_workouts,
+                athletes=athletes,
             )
-            scraper.scrape(max_pages=max_pages, verbose=False)
-            _cache[cache_key] = scraper
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error scraping data: {str(e)}")
-    
-    df = scraper.get_dataframe()
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail="No data found")
-    
-    # Apply pagination
-    paginated_df = df.iloc[offset:offset + limit]
-    
-    # Convert to list of dicts
-    athletes = paginated_df.to_dict(orient="records")
-    
-    return LeaderboardResponse(
-        year=year,
-        division=division,
-        region=region,
-        scaled=scaled,
-        sort=sort,
-        total_athletes=len(df),
-        num_workouts=scraper.get_num_workouts(),
-        athletes=athletes,
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
 
 
 @app.post("/percentile", response_model=PercentileResponse, tags=["Percentile"])
@@ -519,30 +754,38 @@ async def calculate_percentile(
     in the leaderboard for the given workout result.
     """
     try:
-        scraper = get_or_create_scraper(year, division, region, scaled, sort)
-        df = scraper.get_dataframe()
-        
-        if df is None or df.empty:
-            raise HTTPException(status_code=404, detail="No data available")
-        
-        if request.workout_num > scraper.get_num_workouts():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Workout {request.workout_num} not available. Max workouts: {scraper.get_num_workouts()}"
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Check if data exists
+            conditions, params = get_filter_conditions(year, division, region, scaled)
+            cursor.execute(f"SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}", params)
+            if cursor.fetchone()[0] == 0:
+                raise HTTPException(status_code=404, detail="No data available")
+            
+            # Get number of workouts
+            num_workouts = get_num_workouts_from_db(cursor, year, division, region, scaled)
+            
+            if request.workout_num > num_workouts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Workout {request.workout_num} not available. Max workouts: {num_workouts}"
+                )
+            
+            # Calculate percentile
+            percentile, rank, total = calculate_percentile_from_db(
+                cursor, year, division, region, scaled, request.workout_num, request.result
             )
-        
-        calculator = PercentileCalculator(df)
-        percentile, rank, total = calculator.calculate_percentile_and_rank(
-            request.workout_num, request.result
-        )
-        
-        return PercentileResponse(
-            workout_num=request.workout_num,
-            result=request.result,
-            percentile=percentile,
-            rank=rank,
-            total_athletes=total,
-        )
+            
+            cursor.close()
+            
+            return PercentileResponse(
+                workout_num=request.workout_num,
+                result=request.result,
+                percentile=percentile,
+                rank=rank,
+                total_athletes=total,
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -567,27 +810,34 @@ async def calculate_overall_percentile(
     rank, and breakdown of individual workout rankings.
     """
     try:
-        scraper = get_or_create_scraper(year, division, region, scaled, sort)
-        df = scraper.get_dataframe()
-        
-        if df is None or df.empty:
-            raise HTTPException(status_code=404, detail="No data available")
-        
-        # Convert string keys to int if needed (JSON serialization converts int keys to strings)
-        results = {int(k): v for k, v in request.results.items()}
-        
-        calculator = PercentileCalculator(df)
-        percentile, rank, total, score, individual_ranks = calculator.calculate_overall_percentile_and_rank(results)
-        
-        return OverallPercentileResponse(
-            percentile=percentile,
-            rank=rank,
-            total_athletes=total,
-            score=score,
-            individual_ranks=[
-                {"workout": w, "rank": r} for w, r in individual_ranks
-            ],
-        )
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Check if data exists
+            conditions, params = get_filter_conditions(year, division, region, scaled)
+            cursor.execute(f"SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}", params)
+            if cursor.fetchone()[0] == 0:
+                raise HTTPException(status_code=404, detail="No data available")
+            
+            # Convert string keys to int if needed
+            results = {int(k): v for k, v in request.results.items()}
+            
+            # Calculate overall percentile
+            percentile, rank, total, score, individual_ranks = calculate_overall_percentile_from_db(
+                cursor, year, division, region, scaled, results
+            )
+            
+            cursor.close()
+            
+            return OverallPercentileResponse(
+                percentile=percentile,
+                rank=rank,
+                total_athletes=total,
+                score=score,
+                individual_ranks=[
+                    {"workout": w, "rank": r} for w, r in individual_ranks
+                ],
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -596,18 +846,21 @@ async def calculate_overall_percentile(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/cache", tags=["Cache"])
-async def clear_cache():
-    """Clear the cached leaderboard data."""
-    global _cache
-    _cache = {}
-    return {"message": "Cache cleared"}
-
-
-@app.get("/cache/status", tags=["Cache"])
-async def cache_status():
-    """Get the status of cached data."""
-    return {
-        "cached_keys": list(_cache.keys()),
-        "count": len(_cache),
-    }
+@app.get("/db/status", tags=["Database"])
+async def db_status():
+    """Check database connection status."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM crossfit_open_results")
+            count = cursor.fetchone()[0]
+            cursor.close()
+            return {
+                "status": "connected",
+                "total_records": count
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
