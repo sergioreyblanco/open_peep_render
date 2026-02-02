@@ -395,7 +395,18 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
     sorted_results = sorted(parsed_results, key=sort_key)
     
     # Assign ranks based on sorted order (1-indexed, 1 is best)
-    # Then count how many fall into each percentile bucket
+    # Handle ties: athletes with the same result get the same rank
+    ranks = []
+    current_rank = 1
+    for idx, result in enumerate(sorted_results):
+        if idx > 0 and sort_key(result) == sort_key(sorted_results[idx - 1]):
+            # Same as previous, use same rank
+            ranks.append(ranks[-1])
+        else:
+            ranks.append(current_rank)
+        current_rank = idx + 2  # Next position (1-indexed)
+    
+    # Count athletes in each percentile bucket based on their computed rank
     distribution = []
     bucket_size = 5
     
@@ -409,12 +420,8 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         rank_start = int(total_valid * (100 - bucket_end) / 100) + 1
         rank_end = int(total_valid * (100 - bucket_start) / 100)
         
-        # Count athletes in this rank range
-        # Ranks are 1-indexed, so rank 1 is index 0
-        athlete_count = 0
-        for rank in range(rank_start, rank_end + 1):
-            if 1 <= rank <= total_valid:
-                athlete_count += 1
+        # Count athletes whose rank falls in this range
+        athlete_count = sum(1 for r in ranks if rank_start <= r <= rank_end)
         
         is_user_bucket = bucket_start <= user_percentile < bucket_end
         
