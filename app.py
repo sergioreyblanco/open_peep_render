@@ -448,31 +448,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
             else:
                 time_bucket_count = num_buckets
                 reps_bucket_count = 0
-            
-            # Create time buckets - cover FULL range from min to max
-            bucket_size = get_nice_time_bucket_size(time_range, time_bucket_count)
-            bucket_min = int(min_time // bucket_size) * bucket_size
-            bucket_max_time = int(math.ceil(max_time / bucket_size)) * bucket_size
-            
-            # Calculate actual number of buckets needed
-            actual_time_bucket_count = int((bucket_max_time - bucket_min) / bucket_size)
-            
-            for i in range(actual_time_bucket_count - 1, -1, -1):
-                b_start = bucket_min + i * bucket_size
-                b_end = bucket_min + (i + 1) * bucket_size
-                
-                count = sum(1 for v in time_results if b_start <= v < b_end)
-                
-                is_user = False
-                if user_type == "time" and user_value is not None:
-                    is_user = b_start <= user_value < b_end
-                
-                distribution.append(DistributionPoint(
-                    percentile_range=f"{format_time(b_start)}-{format_time(b_end)}",
-                    athlete_count=count,
-                    is_user_bucket=is_user
-                ))
-            
+
             # Create reps buckets for non-finishers - cover FULL range
             if reps_results:
                 min_reps = min(reps_results)
@@ -503,6 +479,31 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                         athlete_count=count,
                         is_user_bucket=is_user
                     ))
+
+            # Create time buckets - cover FULL range from min to max
+            bucket_size = get_nice_time_bucket_size(time_range, time_bucket_count)
+            bucket_min = int(min_time // bucket_size) * bucket_size
+            bucket_max_time = int(math.ceil(max_time / bucket_size)) * bucket_size
+
+            # Calculate actual number of buckets needed
+            actual_time_bucket_count = int((bucket_max_time - bucket_min) / bucket_size)
+            
+            for i in range(actual_time_bucket_count - 1, -1, -1):
+                b_start = bucket_min + i * bucket_size
+                b_end = bucket_min + (i + 1) * bucket_size
+                
+                count = sum(1 for v in time_results if b_start <= v < b_end)
+                
+                is_user = False
+                if user_type == "time" and user_value is not None:
+                    is_user = b_start <= user_value < b_end
+                
+                distribution.append(DistributionPoint(
+                    percentile_range=f"{format_time(b_end)}-{format_time(b_start)}",
+                    athlete_count=count,
+                    is_user_bucket=is_user
+                ))
+
         
         elif reps_results:
             min_reps = min(reps_results)
