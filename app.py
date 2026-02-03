@@ -181,6 +181,33 @@ class AvailableDataResponse(BaseModel):
     workout_types: list[WorkoutInfo]
 
 
+class AvailableYearsResponse(BaseModel):
+    """Available years in the database."""
+    years: list[int]
+
+
+class AvailableDivisionsResponse(BaseModel):
+    """Available divisions for a given year."""
+    divisions: list[str]
+
+
+class AvailableRegionsResponse(BaseModel):
+    """Available regions for a given year and division."""
+    regions: list[str]
+
+
+class AvailableLevelsResponse(BaseModel):
+    """Available levels (scaled types) for given year, division, and region."""
+    levels: list[str]
+
+
+class WorkoutInfoResponse(BaseModel):
+    """Workout information for given filters."""
+    num_workouts: int
+    workout_types: list[WorkoutInfo]
+    total_athletes: int
+
+
 class DistributionPoint(BaseModel):
     """A single point in the distribution histogram."""
     percentile_range: str
@@ -560,12 +587,12 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                     is_user = user_value <= b_end
                 else:
                     is_user = b_start < user_value <= b_end
-            
-            distribution.append(DistributionPoint(
-                percentile_range=f"{int(b_start)+1}-{int(b_end)} rps",
-                athlete_count=count,
-                is_user_bucket=is_user
-            ))
+            if b_start >= 0 and b_end >= 0:
+                distribution.append(DistributionPoint(
+                    percentile_range=f"{int(b_start)+1}-{int(b_end)} rps",
+                    athlete_count=count,
+                    is_user_bucket=is_user
+                ))
     
     else:  # weight
         values = [v for t, v in parsed_results if t == "weight"]
@@ -594,11 +621,12 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                 else:
                     is_user = b_start < user_value <= b_end
             
-            distribution.append(DistributionPoint(
-                percentile_range=f"{int(b_start)+1}-{int(b_end)} lbs",
-                athlete_count=count,
-                is_user_bucket=is_user
-            ))
+            if b_start >= 0 and b_end >= 0:
+                distribution.append(DistributionPoint(
+                    percentile_range=f"{int(b_start)+1}-{int(b_end)} lbs",
+                    athlete_count=count,
+                    is_user_bucket=is_user
+                ))
     
     return distribution
 
@@ -770,6 +798,160 @@ async def get_available_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/available-years", response_model=AvailableYearsResponse, tags=["Data"])
+async def get_available_years():
+    """
+    Get the distinct years available in the database.
+    This is used for the first step in the search flow.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT year FROM crossfit_open_results ORDER BY year DESC")
+            years = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            return AvailableYearsResponse(years=years)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/available-divisions", response_model=AvailableDivisionsResponse, tags=["Data"])
+async def get_available_divisions(
+    year: int = Query(..., description="Competition year to filter by"),
+):
+    """
+    Get the distinct divisions available for a given year.
+    This is used for the second step in the search flow.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT division FROM crossfit_open_results WHERE year = %s ORDER BY division",
+                (year,)
+            )
+            divisions = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            return AvailableDivisionsResponse(divisions=divisions)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/available-regions", response_model=AvailableRegionsResponse, tags=["Data"])
+async def get_available_regions(
+    year: int = Query(..., description="Competition year to filter by"),
+    division: str = Query(..., description="Division to filter by"),
+):
+    """
+    Get the distinct regions available for a given year and division.
+    This is used for the third step in the search flow.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT region FROM crossfit_open_results WHERE year = %s AND division = %s ORDER BY region",
+                (year, division)
+            )
+            regions = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            return AvailableRegionsResponse(regions=regions)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/available-levels", response_model=AvailableLevelsResponse, tags=["Data"])
+async def get_available_levels(
+    year: int = Query(..., description="Competition year to filter by"),
+    division: str = Query(..., description="Division to filter by"),
+    region: str = Query(..., description="Region to filter by"),
+):
+    """
+    Get the distinct levels (scaled types) available for a given year, division, and region.
+    This is used for the fourth step in the search flow.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT scaled FROM crossfit_open_results WHERE year = %s AND division = %s AND region = %s ORDER BY scaled",
+                (year, division, region)
+            )
+            levels = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            return AvailableLevelsResponse(levels=levels)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/workout-info", response_model=WorkoutInfoResponse, tags=["Data"])
+async def get_workout_info(
+    year: int = Query(..., description="Competition year"),
+    division: str = Query(..., description="Division name"),
+    region: str = Query(..., description="Region name"),
+    scaled: str = Query(..., description="Level/scaled type"),
+):
+    """
+    Get workout count and types for the given filters.
+    This is used for the fifth step (result input) in the search flow.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get total athletes for these filters
+            conditions, params = get_filter_conditions(year, division, region, scaled)
+            cursor.execute(f"SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}", params)
+            total_athletes = cursor.fetchone()[0]
+            
+            if total_athletes == 0:
+                return WorkoutInfoResponse(
+                    num_workouts=0,
+                    workout_types=[],
+                    total_athletes=0
+                )
+            
+            # Get number of workouts
+            num_workouts = get_num_workouts_from_db(cursor, year, division, region, scaled)
+            
+            # Detect workout types
+            workout_types = []
+            for i in range(1, num_workouts + 1):
+                result_type = detect_workout_type_from_db(cursor, year, division, region, scaled, i)
+                workout_types.append(WorkoutInfo(workout_num=i, result_type=result_type))
+            
+            cursor.close()
+            
+            return WorkoutInfoResponse(
+                num_workouts=num_workouts,
+                workout_types=workout_types,
+                total_athletes=total_athletes
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/workout-type", tags=["Data"])
+async def get_workout_type(
+    year: int = Query(..., description="Competition year"),
+    division: str = Query(..., description="Division name"),
+    region: str = Query(..., description="Region name"),
+    scaled: str = Query(..., description="Level/scaled type"),
+    workout_num: int = Query(..., ge=1, le=10, description="Workout number"),
+):
+    """
+    Get the workout type for a specific workout number with the given filters.
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            result_type = detect_workout_type_from_db(cursor, year, division, region, scaled, workout_num)
+            cursor.close()
+            return {"workout_num": workout_num, "result_type": result_type}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/load-data", tags=["Data"])
 async def load_data(
     year: int = Query(default=2025, description="Competition year"),
@@ -872,97 +1054,6 @@ async def get_workout_result(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/options", response_model=OptionsResponse, tags=["Options"])
-async def get_options():
-    """Get available options for divisions, regions, scaled types, and sort orders."""
-    return OptionsResponse(
-        divisions=list(CrossFitLeaderboardScraper.DIVISIONS.values()),
-        regions=list(CrossFitLeaderboardScraper.REGIONS.values()),
-        scaled=list(CrossFitLeaderboardScraper.SCALED.values()),
-        sort=list(CrossFitLeaderboardScraper.SORT.values()),
-    )
-
-
-@app.get("/leaderboard", response_model=LeaderboardResponse, tags=["Leaderboard"])
-async def get_leaderboard(
-    year: int = Query(default=2025, description="Competition year"),
-    division: str = Query(default="Men Individual", description="Division name"),
-    region: str = Query(default="Worldwide", description="Region name"),
-    scaled: str = Query(default="Rx'd", description="Workout type"),
-    sort: str = Query(default="Overall", description="Sort order"),
-    max_pages: Optional[int] = Query(default=None, description="Max pages to scrape (ignored, kept for compatibility)"),
-    limit: int = Query(default=100, ge=1, le=1000, description="Number of athletes to return"),
-    offset: int = Query(default=0, ge=0, description="Offset for pagination"),
-    use_cache: bool = Query(default=True, description="Ignored, kept for compatibility"),
-):
-    """
-    Fetch leaderboard data from database.
-    
-    Returns athlete rankings and workout results with pagination.
-    """
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            conditions, params = get_filter_conditions(year, division, region, scaled)
-            
-            # Get total count
-            cursor.execute(f"SELECT COUNT(*) FROM crossfit_open_results WHERE {conditions}", params)
-            total_athletes = cursor.fetchone()[0]
-            
-            if total_athletes == 0:
-                raise HTTPException(status_code=404, detail="No data found")
-            
-            # Get number of workouts
-            num_workouts = get_num_workouts_from_db(cursor, year, division, region, scaled)
-            
-            # Build column list for workout data
-            workout_cols = []
-            for i in range(1, num_workouts + 1):
-                workout_cols.extend([
-                    f"workout_{i}_display",
-                    f"workout_{i}_rank",
-                    f"workout_{i}_score"
-                ])
-            workout_cols_str = ", ".join(workout_cols) if workout_cols else ""
-            
-            # Fetch paginated data
-            base_cols = "id, year, division, region, scaled, sort, rank, name, country"
-            all_cols = f"{base_cols}, {workout_cols_str}" if workout_cols_str else base_cols
-            
-            cursor.execute(f"""
-                SELECT {all_cols} FROM crossfit_open_results 
-                WHERE {conditions} 
-                ORDER BY rank 
-                LIMIT %s OFFSET %s
-            """, params + (limit, offset))
-            
-            # Get column names
-            col_names = [desc[0] for desc in cursor.description]
-            
-            # Convert to list of dicts
-            athletes = []
-            for row in cursor.fetchall():
-                athlete = dict(zip(col_names, row))
-                athletes.append(athlete)
-            
-            cursor.close()
-            
-            return LeaderboardResponse(
-                year=year,
-                division=division,
-                region=region,
-                scaled=scaled,
-                sort=sort,
-                total_athletes=total_athletes,
-                num_workouts=num_workouts,
-                athletes=athletes,
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
 
 
 @app.post("/percentile", response_model=PercentileResponse, tags=["Percentile"])
