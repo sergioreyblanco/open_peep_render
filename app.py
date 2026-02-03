@@ -457,7 +457,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
             # Calculate actual number of buckets needed
             actual_time_bucket_count = int((bucket_max_time - bucket_min) / bucket_size)
             
-            for i in range(actual_time_bucket_count):
+            for i in range(actual_time_bucket_count - 1, -1, -1):
                 b_start = bucket_min + i * bucket_size
                 b_end = bucket_min + (i + 1) * bucket_size
                 
@@ -487,7 +487,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                 # Calculate actual number of buckets needed
                 actual_reps_bucket_count = int((bucket_max_reps - bucket_min_reps) / bucket_size)
                 
-                for i in range(actual_reps_bucket_count):
+                for i in range(actual_reps_bucket_count - 1, -1, -1):
                     # Go from best reps (highest) to worst (lowest)
                     b_end = bucket_max_reps - i * bucket_size
                     b_start = bucket_max_reps - (i + 1) * bucket_size
@@ -499,7 +499,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                         is_user = b_start < user_value <= b_end
                     
                     distribution.append(DistributionPoint(
-                        percentile_range=f"{int(b_start)+1}-{int(b_end)} reps (DNF)",
+                        percentile_range=f"{int(b_start)+1}-{int(b_end)} rps",
                         athlete_count=count,
                         is_user_bucket=is_user
                     ))
@@ -511,7 +511,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
             bucket_size = get_nice_bucket_size(reps_range, num_buckets)
             bucket_max = int(math.ceil(max_reps / bucket_size)) * bucket_size
             
-            for i in range(num_buckets):
+            for i in range(num_buckets - 1, -1, -1):
                 b_end = bucket_max - i * bucket_size
                 b_start = bucket_max - (i + 1) * bucket_size
                 
@@ -528,7 +528,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                         is_user = b_start < user_value <= b_end
                 
                 distribution.append(DistributionPoint(
-                    percentile_range=f"{int(b_start)+1}-{int(b_end)} reps",
+                    percentile_range=f"{int(b_start)+1}-{int(b_end)} rps",
                     athlete_count=count,
                     is_user_bucket=is_user
                 ))
@@ -544,7 +544,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         bucket_size = get_nice_bucket_size(val_range, num_buckets)
         bucket_max = int(math.ceil(max_val / bucket_size)) * bucket_size
         
-        for i in range(num_buckets):
+        for i in range(num_buckets - 1, -1, -1):
             b_end = bucket_max - i * bucket_size
             b_start = bucket_max - (i + 1) * bucket_size
             
@@ -561,7 +561,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
                     is_user = b_start < user_value <= b_end
             
             distribution.append(DistributionPoint(
-                percentile_range=f"{int(b_start)+1}-{int(b_end)} reps",
+                percentile_range=f"{int(b_start)+1}-{int(b_end)} rps",
                 athlete_count=count,
                 is_user_bucket=is_user
             ))
@@ -577,7 +577,7 @@ def calculate_distribution_from_db(cursor, year: int, division: str, region: str
         bucket_size = get_nice_bucket_size(val_range, num_buckets)
         bucket_max = int(math.ceil(max_val / bucket_size)) * bucket_size
         
-        for i in range(num_buckets):
+        for i in range(num_buckets - 1, -1, -1):
             b_end = bucket_max - i * bucket_size
             b_start = bucket_max - (i + 1) * bucket_size
             
